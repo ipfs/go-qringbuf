@@ -103,6 +103,7 @@ type QuantizedRingBuffer struct {
 	streamRemaining    int64
 	cPos               int
 	ePos               int
+	wrapPos            int
 	curRegionSize      int
 	gen                int
 	buf                []byte
@@ -283,6 +284,7 @@ func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err 
 	if debugReservationsEnabled && qrb.curRegionSize > 0 {
 		debugReservations("   letgo [%9d:%9d]\trem:%d", qrb.ePos, qrb.ePos+qrb.curRegionSize, regionRemainder)
 	}
+	qrb.wrapPos = 0 // regardles whether was set or not
 	qrb.ePos += qrb.curRegionSize - regionRemainder
 	qrb.curRegionSize = 0 // when collector is finished, this signals drain-end for Restart()
 	qrb.signalCond(qrb.condEmitterChange)
@@ -373,9 +375,11 @@ func (qrb *QuantizedRingBuffer) collector() {
 				)
 			}
 
-			// emitter is behind OR caught up with us
-			// it may advance but never "pass" us
-			couldRead = qrb.opts.BufferSize - qrb.cPos
+			if qrb.wrapPos > 0 {
+				couldRead = qrb.wrapPos - qrb.cPos
+			} else {
+				couldRead = qrb.opts.BufferSize - qrb.cPos
+			}
 
 			// Either we are end-of-streaming, OR we
 			// - BOTH have enough to fit a minimum read,
@@ -412,17 +416,18 @@ func (qrb *QuantizedRingBuffer) collector() {
 					if debugReservationsEnabled {
 						debugReservations("  copied [%9d:%9d]", 0, qrb.cPos)
 					}
+					if qrb.curRegionSize > 0 {
+						qrb.wrapPos = qrb.ePos
+					}
 				} else {
 					qrb.cPos = 0
 				}
-				qrb.ePos = 0
 
+				qrb.ePos = 0
 				qrb.signalCond(qrb.condCollectorChange)
 
-				// After the move we can safely write from the new cPos onward
-				// ( as long as workers release what we need )
-				couldRead = qrb.opts.BufferSize - qrb.cPos
-				break spaceWaitLoop
+				// loop back from the start to re-evaluate the new ePos/cPos
+				continue spaceWaitLoop
 			}
 
 			if qrb.statsEnabled {
@@ -576,6 +581,7 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 	qrb.gen++
 	qrb.ePos = 0
 	qrb.cPos = 0
+	qrb.wrapPos = 0
 	qrb.errCondition = nil
 	qrb.semStopCollector = make(chan struct{})
 	qrb.semCollectorDone = make(chan struct{})
