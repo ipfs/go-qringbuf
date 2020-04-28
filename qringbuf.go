@@ -15,7 +15,7 @@ const (
 	impossibleStreamLimitText string = "over 4 terabytes"
 )
 
-var ErrStopReceived error = errors.New("stop signal received")
+var ErrStopReceived error = errors.New("stop received")
 
 type Region struct {
 	reserved int32
@@ -59,7 +59,7 @@ func (r *Region) Reserve() {
 		debugReservations(" reserve [%9d:%9d]", r.offset, r.offset+r.size)
 	}
 	for _, s := range r.qrb.regionSectors(r.offset, r.size) {
-		atomic.AddInt32(s.userCount, 1)
+		atomic.AddInt32(&s.userCount, 1)
 	}
 	if debugReservationsEnabled {
 		debugReservations("reserved [%9d:%9d]", r.offset, r.offset+r.size)
@@ -78,41 +78,37 @@ func (r *Region) Release() {
 		debugReservations(" release [%9d:%9d]", r.offset, r.offset+r.size)
 	}
 	for _, s := range r.qrb.regionSectors(r.offset, r.size) {
-		atomic.AddInt32(s.userCount, -1)
+		atomic.AddInt32(&s.userCount, -1)
 	}
 	if debugReservationsEnabled {
 		debugReservations("released [%9d:%9d]", r.offset, r.offset+r.size)
 	}
 
-	select {
-	case r.qrb.condSectorRelease <- struct{}{}:
-	default:
-		// a signal is already waiting to be picked up - blast through
-	}
+	r.qrb.signalCond(r.qrb.condReservationRelease)
 }
 
 type Config struct {
 	MinRegion  int // [1:…] Any result of NextRegion() is guaranteed to be at least that many bytes long, except at EOF
 	MinRead    int // [1:MinRegion] Do not read data from io.Reader until buffer has space to store that many bytes
-	BufferSize int // [MinRegion+MinRead:…] Size of the allocated buffer in bytes
-	MaxCopy    int // [MinRegion:BufferSize/3] Delay "wrap around" until amount of data to copy falls under this threshold
-	SectorSize int // -1‖[1:BufferSize/3] Size of each occupancy sector for region.Reserve()/region.Release() tracking
+	BufferSize int // [MinRead+2*MinRegion:…] Size of the allocated buffer in bytes
+	MaxCopy    int // [MinRegion:BufferSize/2] Delay "wrap around" until amount of data to copy falls under this threshold
+	SectorSize int // [1:BufferSize/3]‖-1 Size of each occupancy sector for region.{Reserve|Release}() tracking
 	Stats      *Stats
 }
 
 type QuantizedRingBuffer struct {
 	sync.Mutex
-	reader          io.Reader
-	opts            Config
-	streamRemaining int64
-	cPos            int
-	ePos            int
-	curRegionSize   int
-	gen             int
-	buf             []byte
-	sectorOccupancy []sectorState
-	errCondition    error
-	statsEnabled    bool
+	reader             io.Reader
+	opts               Config
+	streamRemaining    int64
+	cPos               int
+	ePos               int
+	curRegionSize      int
+	gen                int
+	buf                []byte
+	reservationSectors []*sectorState
+	errCondition       error
+	statsEnabled       bool
 
 	/*
 
@@ -137,14 +133,14 @@ type QuantizedRingBuffer struct {
 	//
 	// See multiple implementations at https://stackoverflow.com/questions/29923666/waiting-on-a-sync-cond-with-a-timeout
 	// and the *very* involved discussion in https://github.com/golang/go/issues/21165
-	condSectorRelease chan struct{}
+	condReservationRelease chan struct{}
 	// If we were using sync.Cond we would have used a single var for both of these
 	// But because the channels can not really observe locks, we need to have one
 	// dedicated channel for each thread. Otherwise after a broadcast+wait a thread
 	// could "eat" its own broadcast, never do anything with it, and then get stuck
 	// waiting on the other thread that now can never move
-	condCollectorMoved chan struct{}
-	condEmitterMoved   chan struct{}
+	condCollectorChange chan struct{}
+	condEmitterChange   chan struct{}
 
 	// This pair of channels implements stop/end semaphores for the collector goroutine
 	// Think of them as very specialized, internal-only ctx, that exist to correctly
@@ -166,7 +162,7 @@ type Stats struct {
 }
 
 type sectorState struct {
-	userCount       *int32
+	userCount       int32
 	thisSectorStart int
 	nextSectorStart int
 }
@@ -189,19 +185,19 @@ func NewFromReader(
 			cfg.MinRegion,
 		)
 	}
-	if cfg.BufferSize < cfg.MinRegion+cfg.MinRead {
+	if cfg.BufferSize < 2*cfg.MinRegion+cfg.MinRead {
 		return nil, fmt.Errorf(
 			"value of BufferSize '%d' out of range [%d:...]",
 			cfg.BufferSize,
-			cfg.MinRegion+cfg.MinRead,
+			2*cfg.MinRegion+cfg.MinRead,
 		)
 	}
-	if cfg.MaxCopy < cfg.MinRegion || cfg.MaxCopy > cfg.BufferSize/3 {
+	if cfg.MaxCopy < cfg.MinRegion || cfg.MaxCopy > cfg.BufferSize/2 {
 		return nil, fmt.Errorf(
 			"value of MaxCopy '%d' out of range [%d:%d]",
 			cfg.MaxCopy,
 			cfg.MinRegion,
-			cfg.BufferSize/3,
+			cfg.BufferSize/2,
 		)
 	}
 	if cfg.SectorSize > cfg.BufferSize/3 ||
@@ -224,25 +220,25 @@ func NewFromReader(
 		semCollectorDone: make(chan struct{}),
 
 		// never close these, they replace sync.Cond's
-		condSectorRelease:  make(chan struct{}, 1),
-		condCollectorMoved: make(chan struct{}, 1),
-		condEmitterMoved:   make(chan struct{}, 1),
+		condReservationRelease: make(chan struct{}, 1),
+		condCollectorChange:    make(chan struct{}, 1),
+		condEmitterChange:      make(chan struct{}, 1),
 	}
 	close(qrb.semStopCollector)
 	close(qrb.semCollectorDone)
 
 	if cfg.SectorSize > 0 {
-		sectors := cfg.BufferSize / cfg.SectorSize
+		sectorCount := cfg.BufferSize / cfg.SectorSize
 		// silliness to avoid invoking math.Ceil
 		if cfg.BufferSize%cfg.SectorSize != 0 {
-			sectors++
+			sectorCount++
 		}
-		qrb.sectorOccupancy = make([]sectorState, sectors)
-		for i := 0; i < sectors; i++ {
-			qrb.sectorOccupancy[i] = sectorState{
-				new(int32),
-				i * cfg.SectorSize,
-				(i + 1) * cfg.SectorSize,
+		qrb.reservationSectors = make([]*sectorState, sectorCount)
+		for sectorCount > 0 {
+			sectorCount--
+			qrb.reservationSectors[sectorCount] = &sectorState{
+				thisSectorStart: cfg.SectorSize * sectorCount,
+				nextSectorStart: cfg.SectorSize * (sectorCount + 1),
 			}
 		}
 	}
@@ -250,7 +246,7 @@ func NewFromReader(
 	return qrb, nil
 }
 
-func (qrb *QuantizedRingBuffer) signalPosChange(c chan<- struct{}) {
+func (qrb *QuantizedRingBuffer) signalCond(c chan<- struct{}) {
 	select {
 	case c <- struct{}{}:
 	default:
@@ -284,9 +280,12 @@ func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err 
 		)
 	}
 
+	if debugReservationsEnabled && qrb.curRegionSize > 0 {
+		debugReservations("   letgo [%9d:%9d]\trem:%d", qrb.ePos, qrb.ePos+qrb.curRegionSize, regionRemainder)
+	}
 	qrb.ePos += qrb.curRegionSize - regionRemainder
-	qrb.curRegionSize = 0 // Signals drain-end
-	qrb.signalPosChange(qrb.condEmitterMoved)
+	qrb.curRegionSize = 0 // when collector is finished, this signals drain-end for Restart()
+	qrb.signalCond(qrb.condEmitterChange)
 
 	// Wait ( collector moves our start pos on wraparound ) while:
 	// - no error at all ( not even EOF )
@@ -299,7 +298,7 @@ waitOnCollector:
 		}
 		qrb.Unlock()
 		select {
-		case <-qrb.condCollectorMoved:
+		case <-qrb.condCollectorChange:
 			// just waiting, nothing to do
 		case <-qrb.semCollectorDone:
 			// when we are done - we are done
@@ -327,6 +326,9 @@ waitOnCollector:
 
 	qrb.gen++ // counter separate from the stats, for mis-reservation errors
 	qrb.curRegionSize = qrb.cPos - qrb.ePos
+	if debugReservationsEnabled {
+		debugReservations("    held [%9d:%9d]", qrb.ePos, qrb.ePos+qrb.curRegionSize)
+	}
 	return &Region{
 		offset: qrb.ePos,
 		size:   qrb.curRegionSize,
@@ -339,7 +341,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 	// No .Unlock() in this defer - see comment a bit further down
 	defer func() {
 		close(qrb.semCollectorDone)
-		qrb.signalPosChange(qrb.condCollectorMoved) // one last signal, emitter won't wait after that
+		qrb.signalCond(qrb.condCollectorChange) // one last signal, emitter won't wait after above closes
 	}()
 
 	var mustRead, couldRead, didRead int
@@ -415,7 +417,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 				}
 				qrb.ePos = 0
 
-				qrb.signalPosChange(qrb.condCollectorMoved)
+				qrb.signalCond(qrb.condCollectorChange)
 
 				// After the move we can safely write from the new cPos onward
 				// ( as long as workers release what we need )
@@ -429,7 +431,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 			}
 			qrb.Unlock()
 			select {
-			case <-qrb.condEmitterMoved:
+			case <-qrb.condEmitterChange:
 				// just waiting, nothing to do
 			case <-qrb.semStopCollector:
 				qrb.Lock()
@@ -457,11 +459,21 @@ func (qrb *QuantizedRingBuffer) collector() {
 			}
 		}
 
-		// we may shrink the free range if it would save us from yielding
+		// we may shrink the free range if it would save us from waiting
 		couldRead = qrb.regionFreeWait(qrb.cPos, mustRead, couldRead)
 		if qrb.errCondition != nil {
 			qrb.Unlock()
 			return
+		} else {
+			// one last check before asking the reader for more
+			select {
+			case <-qrb.semStopCollector:
+				qrb.errCondition = ErrStopReceived
+				qrb.Unlock()
+				return
+			default:
+				// proceed
+			}
 		}
 
 		if debugReservationsEnabled {
@@ -480,6 +492,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 		if didRead > 0 {
 			qrb.cPos += didRead
 			qrb.streamRemaining -= int64(didRead)
+			qrb.signalCond(qrb.condCollectorChange)
 		} else if qrb.errCondition == nil {
 			log.Panic("zero-size read without a raised error")
 		}
@@ -493,7 +506,6 @@ func (qrb *QuantizedRingBuffer) collector() {
 			return
 		}
 
-		qrb.signalPosChange(qrb.condCollectorMoved)
 		qrb.Unlock()
 	}
 }
@@ -539,7 +551,7 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 	// wait until drained
 	for qrb.curRegionSize > 0 {
 		qrb.Unlock()
-		<-qrb.condEmitterMoved
+		<-qrb.condEmitterChange
 		qrb.Lock()
 	}
 
@@ -586,7 +598,7 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 	// done := qrb.semCollectorDone
 	// go func() {
 	// 	t := time.NewTimer(20 * time.Minute)
-	// 	// t := time.NewTimer(2 * time.Second)
+	// 	// t := time.NewTimer(10 * time.Second)
 	// 	select {
 	// 	case <-done:
 	// 		t.Stop()
@@ -594,8 +606,8 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 	// 		qrb.Lock()
 	// 		fmt.Fprintf(os.Stderr,
 	// 			"\n\ncollectorChan:%#v\nemitterChan:  %#v\n\n| -- %d -- @ E @ -- %d -- @ C @ -- %d |\nBufsize:%9d\nMinRead:%9d\nMinReg: %9d\nMaxCopy:%9d\n\n| -- [ %d curRegion %d ] --\ncurReg: %9d\n\n\n",
-	// 			qrb.condCollectorMoved,
-	// 			qrb.condEmitterMoved,
+	// 			qrb.condCollectorChange,
+	// 			qrb.condEmitterChange,
 	// 			qrb.ePos,
 	// 			qrb.cPos-qrb.ePos,
 	// 			qrb.opts.BufferSize-qrb.cPos,
@@ -614,26 +626,14 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 	return nil
 }
 
-func (qrb *QuantizedRingBuffer) regionSectors(offset, size int) []sectorState {
-	if size == 0 || qrb.sectorOccupancy == nil {
+func (qrb *QuantizedRingBuffer) regionSectors(offset, size int) []*sectorState {
+	if size == 0 || qrb.opts.SectorSize < 0 {
 		return nil
 	}
-	return qrb.sectorOccupancy[(offset / qrb.opts.SectorSize):((offset+size-1)/qrb.opts.SectorSize + 1)]
+	return qrb.reservationSectors[(offset / qrb.opts.SectorSize):((offset+size-1)/qrb.opts.SectorSize + 1)]
 }
 
 func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available int) {
-	// Ensure there is enough free space from offset, to satisfy
-	// either the desired or at least the required size
-	//
-	// This codepath is entered by the collector only, which means
-	// that when we are here the emitter is blocked.  Since we
-	// already validated the activeRegion region does not overlap with
-	// anything we will be examining, all we need to check is that
-	// all reserveation sectors have no users
-	//
-	// It is safe to do this sequentially once per sector, as the
-	// emitter won't advance past us
-
 	if min == 0 && max == 0 {
 		return 0
 	} else if min > max {
@@ -647,13 +647,17 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 
 	if debugReservationsEnabled {
 		debugReservations(" waiting [%9d:%9d]\tmin:%d\tmax:%d", offset, offset+max, min, max)
+		defer func() {
+			debugReservations("  waited [%9d:%9d]\tmin:%d\tmax:%d", offset, offset+available, min, max)
+		}()
 	}
 
-	// allow the emitter to move while we check
-	qrb.Unlock()
-
-	var stopReceived bool
 	var t0 time.Time
+	var stopReceived bool
+
+	// We do not refer to volatile parts of qrb.* in the loop
+	// Remain unlocked for the duration of waiting on releases
+	qrb.Unlock()
 	defer func() {
 		qrb.Lock()
 		if qrb.statsEnabled {
@@ -662,32 +666,26 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 		if stopReceived {
 			qrb.errCondition = ErrStopReceived
 		}
-		if debugReservationsEnabled {
-			debugReservations("  waited [%9d:%9d]\tmin:%d\tmax:%d", offset, offset+available, min, max)
-		}
 	}()
-
 	if qrb.statsEnabled {
 		t0 = time.Now()
 	}
 
+	// Ensure there is enough free space from offset, to satisfy
+	// either the desired or at least the required size
+	//
+	// This codepath is entered by the collector only, which means
+	// that when we are here the emitter is blocked.  Since we
+	// already validated the activeRegion region does not overlap with
+	// anything we will be examining, all we need to check is that
+	// all reserveation sectors have no users, and that we are not
+	// stepping on the wrap-position if any
+	//
+	// It is safe to do this sequentially once per sector, as the
+	// emitter won't advance past us
 	for _, s := range qrb.regionSectors(offset, max) {
-		for {
 
-			if atomic.LoadInt32(s.userCount) == 0 {
-				// sector is free for our purposes \o/
-
-				if offset > s.thisSectorStart {
-					available += (s.nextSectorStart - offset)
-				} else {
-					available += qrb.opts.SectorSize
-				}
-
-				if available > max {
-					available = max
-				}
-				break
-			}
+		for atomic.LoadInt32(&s.userCount) != 0 {
 
 			// we are about to block - bail if we are happy
 			if available >= min {
@@ -696,28 +694,54 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 
 			select {
 			// just block until release or stop
-			case <-qrb.condSectorRelease:
+			case <-qrb.condReservationRelease:
 			case <-qrb.semStopCollector:
 				stopReceived = true
 				return
 			}
+
+		}
+
+		// sector is free for our purposes \o/
+		if offset > s.thisSectorStart {
+			available += (s.nextSectorStart - offset)
+		} else {
+			available += qrb.opts.SectorSize
+		}
+
+		if available > max {
+			available = max
 		}
 	}
 	return
 }
 
+/*
+
+while true; do tmp/maintbin/dezstd $( ls maint/testdata/*repeat* | sort -R ) $( ls maint/testdata/*repeat* | sort -R ) \
+| go run ./cmd/stream-dagger/ --multipart --ipfs-add-compatible-command="--cid-version=1 --chunker=rabin" \
+--emit-stdout=none --emit-stderr=roots-jsonl,chunks-jsonl 2>e1 >s1
+grep 'event.*root' e1 | grep -oE 'cid.*' | sort | md5sum | grep 759d2726a1a55acda87368565ebf8a1c || break
+done
+
+while true; do zstd -qdck maint/testdata/large_repeat_1GiB.zst \
+| go run ./cmd/stream-dagger/ --ipfs-add-compatible-command="--cid-version=1 --chunker=rabin" \
+--emit-stdout=none --emit-stderr=roots-jsonl,chunks-jsonl 2>e2 >s2
+grep 'event.*root.*bafybeifdyy47lpatwhgie4otzn6rhjbjvrxpj3tlbze2j5xlsexpvca32y' e2 || break
+done
+
+while true; do zstd -qdck maint/testdata/repeat_0.04GiB_174.zst \
+| go run ./cmd/stream-dagger/ --ipfs-add-compatible-command="--cid-version=1 --chunker=rabin" \
+--emit-stdout=none --emit-stderr=roots-jsonl,chunks-jsonl 2>e3 >s3
+grep 'event.*root.*bafybeid5puqcsobeg226l6dfvcwznyi4tq4ezjmphikdi2pszffw3stuym' e3 || break
+done
+
+*/
 const debugReservationsEnabled bool = false
 
-/*
-while true; do zstd -qdck maint/testdata/repeat_0.04GiB_174.zst \
-| go run ./cmd/stream-dagger/ --ipfs-add-compatible-command="--chunker=rabin --cid-version=1" \
---emit-stdout=none --emit-stderr=roots-jsonl,chunks-jsonl 2>e1 >s1
-grep bafybeid5puqcsobeg226l6dfvcwznyi4tq4ezjmphikdi2pszffw3stuym e1 || break
-done
-*/
 func debugReservations(f string, a ...interface{}) {
 	fmt.Printf(
-		"%-53s"+f+"\n",
+		"%-54s"+f+"\n",
 		append(
 			[]interface{}{time.Now()},
 			a...,
