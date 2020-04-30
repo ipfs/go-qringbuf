@@ -25,7 +25,7 @@
 //
 //  qrb, initErr := qringbuf.NewFromReader( *someReader, qringbuf.Config{ … } )
 //  …
-//  readLimit = int( stopReadingAfterThatManyBytes )
+//  readLimit = int64( stopReadingAfterThatManyBytes )
 //  startErr := qrb.StartFill( readLimit )
 //  …
 //  var available, processed int
@@ -210,7 +210,7 @@ func (r *Region) Size() int { return r.size }
 func (r *Region) Bytes() []byte { return r.qrb.buf[r.offset : r.offset+r.size] }
 
 // SubRegion is analogous to re-slicing. Supplying offset/length values causing
-// an out of bounds re-slice result in log.Panic(). As a special case one can
+// an out of bounds re-slice results in log.Panic(). As a special case one can
 // "clone" a *Region object via:
 //  clone := region.SubRegion( 0, region.Size() )
 func (r *Region) SubRegion(offset, length int) *Region {
@@ -352,9 +352,13 @@ type QuantizedRingBuffer struct {
 	semCollectorDone chan struct{}
 }
 
-// Stats can be optionally passed as part of the constructor options. Note that
-// collecting these statistics will incur a performance penalty, mainly due to
-// the repeated calls to time.Now()
+// Stats is a simple struct of counters. When (optionally) supplied as part of
+// the constructor options, its fields will be incremented through the course
+// of the qringbuf object lifetime. In order to obtain a consistent read of
+// the stats values, either the collector should have terminated, or you should
+// obtain a Lock() before accessing the structure.
+// Note that collecting these stats will incur a performance penalty, mainly
+// due to the repeated calls to time.Now()
 type Stats struct {
 	ReadCalls                int64 `json:"readCalls"`
 	CollectorYields          int64 `json:"collectorYields"`
@@ -477,8 +481,8 @@ func (qrb *QuantizedRingBuffer) Buffered() int {
 // maximum size of a record. By initializing your qringbuf with MinRegion equal
 // to this maximum value, you guarantee never experiencing an under-read.
 // Each call to NextRegion must advance the stream by at least a single byte:
-// calling NextRegion with regionRemainder equal or larger than last *Region
-// results in log.Panic()
+// calling NextRegion with regionRemainder equal or larger than Size() of the
+// last *Region results in log.Panic()
 func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err error) {
 	var t0 time.Time
 
