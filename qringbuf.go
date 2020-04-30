@@ -19,6 +19,8 @@
 //    ◦ NextRegion() has not been called again allowing writes into the buffer
 //    ◦ *Region.Reserve() was invoked, which blocks writes until a *Region.Release()
 //
+// Examples
+//
 // In code the basic usage looks roughly like this:
 //
 //  qrb, initErr := qringbuf.NewFromReader( *someReader, qringbuf.Config{ … } )
