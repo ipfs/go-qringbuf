@@ -1,3 +1,166 @@
+// Package qringbuf provides a concurrency-friendly zero-copy abstraction of
+// io.ReadAtLeast() over a pre-allocated ring-buffer, populated asynchronously
+// by a standalone goroutine. It is primarily designed for processing a series
+// of arbitrary streams each comprised of variable-length records.
+//
+// Specifically an object of this package makes the following guarantees:
+//  • Memory is allocated only at construction time, never during streaming
+//  • StartFill() spawns off a single goroutine (collector) which terminates when:
+//    ◦ It reaches readLimit or receives an expected io.EOF from the wrapped Reader
+//    ◦ Immediately at any other error
+//    ◦ Af the next chance to evaluate a signal received from StopFill()
+//      (most io.Read() operations are not cancelable, and may block forever)
+//  • Every call to NextRegion() blocks until it can return:
+//    ◦ A *Region object representing a contiguous slice of at least MinRegion bytes
+//    ◦ A smaller "trailing" *Region and an io.EOF or ErrCollectorStopped
+//    ◦ A nil-Region and any other error
+//  • *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
+//  • Data backing a *Region is guaranteed to remain intact provided:
+//    ◦ NextRegion() has not been called again allowing writes into the buffer
+//    ◦ *Region.Reserve() was invoked, which blocks writes until a *Region.Release()
+//
+// In code the basic usage looks roughly like this:
+//
+//  qrb, initErr := qringbuf.NewFromReader( *someReader, qringbuf.Config{ … } )
+//  …
+//  readLimit = int( stopReadingAfterThatManyBytes )
+//  startErr := qrb.StartFill( readLimit )
+//  …
+//  var available, processed int
+//  for {
+//      reg, streamErr := qrb.NextRegion( available - processed )
+//      if reg == nil {
+//          return streamErr
+//      }
+//
+//      // work with region, processing all or just a portion of the data
+//      available = reg.Size()
+//      processed = frobnicate( reg.Bytes(), … )
+//  }
+//
+// In addition one can operate over individual (sub)regions with "fearless
+// concurrency":
+//
+//  …
+//  var available, processed int
+//  for {
+//      reg, streamErr := qrb.NextRegion( available - processed )
+//      if reg == nil {
+//          return streamErr
+//      }
+//
+//      available = reg.Size()
+//      processed = 256
+//
+//      subReg := reg.SubRegion( 0, 256 )
+//      subReg.Reserve()
+//
+//      go func() {
+//          frobnicate( subReg.Bytes(), … )
+//          subReg.Release()
+//      }()
+//  }
+//
+// In all cases the background collector goroutine reading from *someReader
+// into the ring buffer is guaranteed to:
+//  - never overwrite the buffer portion backing the latest result of NextRegion()
+//  - never overwrite any buffer portion backing a Reserve()d (Sub)Region
+//
+// Implementation notes
+//
+// Unlike io.ReadAtLeast, errors from the underlying reader are always made
+// available on NextRegion(). As with the standard io.* semantics an error can
+// be returned together with a result. One should always check whether the
+// *Region return value is nil first, before processing the error,
+//
+// Changes of the emitter and collector positions are protected by a mutex on
+// the qringbuf object. Any call accessing the buffer state will block until
+// this lock can be obtained. One can also lock the mutex if the collector
+// goroutine needs to be paused for whatever reason.
+//
+// The region Reserve()/Release() functionality does not use the mutex, ensuring
+// that an asynchronous Release() call can not be affected by the current state
+// of the buffer. Reservation tracking is implemented as an atomically modified
+// list of reservation counts, one int32 per SectorSize bytes of the buffer.
+//
+// The reservation system explicitly allows "recursive locking": you can hold
+// an arbitrary number of reservations over a sector by repeatedly creating
+// SubRegion() objects. Care must be taken to release every single reservation
+// obtained previously, otherwise the collector will remain blocked forever.
+//
+// Here is an illustration of a qringbuf object lifecycle initialized with
+//  {
+//    BufferSize: 64,
+//    MinRegion:  16,
+//    MinRead:    8,
+//    MaxCopy     24,
+//  }
+// ·
+//
+//  † C is the collector position: the *end* of the most recent read from the underlying io.Reader
+//    E is the emitter position: the *start* of the most recently returned NextRegion()
+//    W is the last value of "E" before a wrap took place, 0 otherwise
+//
+//  ⓪ Buffer initialized, StartFill(…) is called.
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//       C=0                                                             ┃
+//       E=0                                                             ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//  ① NextRegion(0) is blocked until MinRegion of 16 is available,
+//     fill in progress
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//       cccccccccc|C=10                                                 ┃
+//       E=0                                                             ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//  ② NextRegion(0) returned the first 30 bytes when it could,
+//     collector keeps reading further
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//       eeeeeeeeeeeeeeeeeeeeeeeeeeeeeecccccccccc|C=40                   ┃
+//       E=0==========================<                                  ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//  ③ User reserves subRegion 18~21 for async workers, recycles last 6 of the
+//     30 bytes, NextRegion(6) returns 17 bytes available at the time, 23 total.
+//     Collector keeps reading, until it can no longer satisfy MinRead
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//                         RRRR  eeeeeeeeeeeeeeeeeeeeeeecccccccccccc|C=59┃
+//                         RRRR  E=24==================<                 ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//  ④ User recycles last 6 bytes, NextRegion(6) serves the remaining 18 bytes
+//     Collector now can satisfy MaxCopy, and copies everything over,
+//     repositioning the emitter index. It then blocks, as it can't write
+//     past the not-yet released reservation.
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//       W=41wwwwwwwwwwwwww|C=18                  eeeeeeeeeeeeeeeeee|    ┃
+//       E=0               RRRR                   W=41=============<|    ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//  ⑤ The async job finishes, reservation is released, collector can now
+//     advance further, and blocks again as NextRegion() has not been called
+//     meaning the last 18 bytes are still being processed.
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//       W=41wwwwwwwwwwwwwwccccccccccccccccccccccc|C=41|eeeeeeeeeeee|    ┃
+//       E=0                                      W=41=============<|    ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//  ⑥ User recycles 4 bytes, NextRegion(4) serves available 27 bytes, and
+//     the cycle repeats from the top until error or EOF
+//       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+//                     wwwwccccccccccccccccccccccc|C=41                  ┃
+//                     E=14======================<|                      ┃
+//       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+//       |0        |10       |20       |30       |40       |50       |60
+//
+//
 package qringbuf
 
 import (
@@ -15,8 +178,16 @@ const (
 	impossibleStreamLimitText string = "over 4 terabytes"
 )
 
-var ErrStopReceived error = errors.New("stop received")
+// ErrCollectorStopped is the error returned by NextRegion() before the
+// background collector goroutine has been started with StartFill(), or
+// after StopFill() has been called explicitly. Note that when a readLimit
+// supplied to StartFill() is reached, and the collector stops on its own,
+// the error state is io.EOF or io.ErrUnexpectedEOF
+var ErrCollectorStopped error = errors.New("collector stopped")
 
+// Region is an object representing a part of the buffer. Initially a *Region
+// is obtained by calling NextRegion(), but then one can subdivide a *Region
+// object into smaller portions via SubRegion().
 type Region struct {
 	reserved int32
 	gen      int
@@ -25,8 +196,21 @@ type Region struct {
 	qrb      *QuantizedRingBuffer
 }
 
-func (r *Region) Size() int     { return r.size }
+// Size returns the size of the region in bytes. It is equivalent to (but
+// cheaper than):
+//  len( r.Bytes )
+func (r *Region) Size() int { return r.size }
+
+// Bytes returns a slice of the underlying ring buffer. One should take care
+// to copy or finish using the returned slice before making another call to
+// NextRegion(). If Reserve() has been invoked, then the slice is guaranteed
+// to remain intact before the corresponding Release() call.
 func (r *Region) Bytes() []byte { return r.qrb.buf[r.offset : r.offset+r.size] }
+
+// SubRegion is analogous to re-slicing. Supplying offset/length values causing
+// an out of bounds re-slice result in log.Panic(). As a special case one can
+// "clone" a *Region object via:
+//  clone := region.SubRegion( 0, region.Size() )
 func (r *Region) SubRegion(offset, length int) *Region {
 	if offset < 0 || length <= 0 || offset+length > r.size {
 		log.Panicf(
@@ -44,6 +228,13 @@ func (r *Region) SubRegion(offset, length int) *Region {
 		qrb:    r.qrb,
 	}
 }
+
+// Reserve marks the buffer area backing this *Region object as a "no-write"
+// zone, until the corresponding Release() has been called. Losing a Reserve()d
+// *Region object before calling Release() will lead to a deadlock: neither
+// NextRegion() nor the collector will be able to proceed beyond the point
+// now-forever reserved. Calling Reserve() more than once on the same object
+// results in log.Panic()
 func (r *Region) Reserve() {
 	if atomic.AddInt32(&r.reserved, 1) != 1 {
 		log.Panicf(
@@ -65,6 +256,10 @@ func (r *Region) Reserve() {
 		debugReservations("reserved [%9d:%9d]", r.offset, r.offset+r.size)
 	}
 }
+
+// Release marks the buffer area backing this *Region object free after
+// a previous Reserve() call. Calling Release() more than once on the same
+// object, or before Reserve() has been called, results in log.Panic()
 func (r *Region) Release() {
 	if atomic.AddInt32(&r.reserved, -1) != 0 {
 		log.Panicf(
@@ -87,12 +282,15 @@ func (r *Region) Release() {
 	r.qrb.signalCond(r.qrb.condReservationRelease)
 }
 
+// Config is the structure of options expected at initialization time. Note
+// that passing a reference to a *Stats structure will incur a penalty, mainly
+// from repeatedly calling time.Now()
 type Config struct {
 	MinRegion  int // [1:…] Any result of NextRegion() is guaranteed to be at least that many bytes long, except at EOF
 	MinRead    int // [1:MinRegion] Do not read data from io.Reader until buffer has space to store that many bytes
 	BufferSize int // [MinRead+2*MinRegion:…] Size of the allocated buffer in bytes
 	MaxCopy    int // [MinRegion:BufferSize/2] Delay "wrap around" until amount of data to copy falls under this threshold
-	SectorSize int // [1:BufferSize/3]‖-1 Size of each occupancy sector for region.{Reserve|Release}() tracking
+	SectorSize int // [4096:BufferSize/3] Size of each occupancy sector for region.{Reserve|Release}() tracking
 	Stats      *Stats
 }
 
@@ -126,9 +324,8 @@ type QuantizedRingBuffer struct {
 
 	*/
 	// Each one of these channels emulates a distinct sync.Cond.(Signal|Wait) with strictly 1 .Wait-er
-	//
-	// The channels are initialized with len(1) and never closed
-	// Signalling is achieved by send/receive of a single empty struct
+	// * The channels are initialized with len(1) and never closed
+	// * Signalling is achieved by send/receive of a single empty struct
 	//
 	// The reason for not simply using sync.Cond is to keep Region.Release() lock-free
 	//
@@ -153,6 +350,9 @@ type QuantizedRingBuffer struct {
 	semCollectorDone chan struct{}
 }
 
+// Stats can be optionally passed as part of the constructor options. Note that
+// collecting these statistics will incur a performance penalty, mainly due to
+// the repeated calls to time.Now()
 type Stats struct {
 	ReadCalls                int64 `json:"readCalls"`
 	CollectorYields          int64 `json:"collectorYields"`
@@ -201,11 +401,9 @@ func NewFromReader(
 			cfg.BufferSize/2,
 		)
 	}
-	if cfg.SectorSize > cfg.BufferSize/3 ||
-		cfg.SectorSize == 0 ||
-		cfg.SectorSize < -1 {
+	if cfg.SectorSize < 4096 || cfg.SectorSize > cfg.BufferSize/3 {
 		return nil, fmt.Errorf(
-			"value of SectorSize '%d' out of range [1:%d] || -1",
+			"value of SectorSize '%d' out of range [4096:%d]",
 			cfg.SectorSize,
 			cfg.BufferSize/3,
 		)
@@ -216,7 +414,7 @@ func NewFromReader(
 		opts:             cfg,
 		statsEnabled:     (cfg.Stats != nil),
 		buf:              make([]byte, cfg.BufferSize),
-		errCondition:     io.EOF,
+		errCondition:     ErrCollectorStopped,
 		semStopCollector: make(chan struct{}),
 		semCollectorDone: make(chan struct{}),
 
@@ -228,19 +426,17 @@ func NewFromReader(
 	close(qrb.semStopCollector)
 	close(qrb.semCollectorDone)
 
-	if cfg.SectorSize > 0 {
-		sectorCount := cfg.BufferSize / cfg.SectorSize
-		// silliness to avoid invoking math.Ceil
-		if cfg.BufferSize%cfg.SectorSize != 0 {
-			sectorCount++
-		}
-		qrb.reservationSectors = make([]*sectorState, sectorCount)
-		for sectorCount > 0 {
-			sectorCount--
-			qrb.reservationSectors[sectorCount] = &sectorState{
-				thisSectorStart: cfg.SectorSize * sectorCount,
-				nextSectorStart: cfg.SectorSize * (sectorCount + 1),
-			}
+	sectorCount := cfg.BufferSize / cfg.SectorSize
+	// silliness to avoid invoking math.Ceil
+	if cfg.BufferSize%cfg.SectorSize != 0 {
+		sectorCount++
+	}
+	qrb.reservationSectors = make([]*sectorState, sectorCount)
+	for sectorCount > 0 {
+		sectorCount--
+		qrb.reservationSectors[sectorCount] = &sectorState{
+			thisSectorStart: cfg.SectorSize * sectorCount,
+			nextSectorStart: cfg.SectorSize * (sectorCount + 1),
 		}
 	}
 
@@ -255,6 +451,32 @@ func (qrb *QuantizedRingBuffer) signalCond(c chan<- struct{}) {
 	}
 }
 
+// Buffered returns the current amount of data already read from the underlying
+// reader, but not yet served via NextRegion(). It is primarily useful for
+// informative error messages:
+//
+//  if err == io.ErrUnexpectedEOF {
+//    return fmt.Errorf(
+//      "unexpected end of stream after %d bytes (stream expected to be %d bytes long)",
+//      totalProcessedSoFar + int64( qrb.Buffered() ),
+//      expectedStreamLengthPassedToStartFill,
+//    )
+//  }
+func (qrb *QuantizedRingBuffer) Buffered() int {
+	defer qrb.Unlock()
+	qrb.Lock()
+	return qrb.cPos - (qrb.ePos + qrb.curRegionSize)
+}
+
+// NextRegion returns a *Region object representing a portion of the underlying
+// stream. You can explicitly request overlapping *Region's by supplying the
+// number of bytes to "step back". This is especially useful when processing a
+// stream of variable-length records where the only information you have is the
+// maximum size of a record. By initializing your qringbuf with MinRegion equal
+// to this maximum value, you guarantee never experiencing an under-read.
+// Each call to NextRegion must advance the stream by at least a single byte:
+// calling NextRegion with regionRemainder equal or larger than last *Region
+// results in log.Panic()
 func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err error) {
 	var t0 time.Time
 
@@ -318,7 +540,8 @@ waitOnCollector:
 
 	if qrb.errCondition != nil {
 		if qrb.ePos < qrb.cPos &&
-			(qrb.errCondition == io.EOF || qrb.errCondition == ErrStopReceived) {
+			(qrb.errCondition == io.EOF ||
+				qrb.errCondition == ErrCollectorStopped) {
 			// not yet done with what the collector left us
 			// return the remaining range at the end
 		} else {
@@ -443,7 +666,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 				if qrb.statsEnabled {
 					qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
 				}
-				qrb.errCondition = ErrStopReceived
+				qrb.errCondition = ErrCollectorStopped
 				qrb.Unlock()
 				return
 			}
@@ -469,16 +692,16 @@ func (qrb *QuantizedRingBuffer) collector() {
 		if qrb.errCondition != nil {
 			qrb.Unlock()
 			return
-		} else {
-			// one last check before asking the reader for more
-			select {
-			case <-qrb.semStopCollector:
-				qrb.errCondition = ErrStopReceived
-				qrb.Unlock()
-				return
-			default:
-				// proceed
-			}
+		}
+
+		// one last stop-check before asking the reader for more
+		select {
+		case <-qrb.semStopCollector:
+			qrb.errCondition = ErrCollectorStopped
+			qrb.Unlock()
+			return
+		default:
+			// proceed
 		}
 
 		if debugReservationsEnabled {
@@ -504,6 +727,8 @@ func (qrb *QuantizedRingBuffer) collector() {
 
 		if qrb.errCondition == nil && qrb.streamRemaining == 0 {
 			qrb.errCondition = io.EOF
+		} else if qrb.errCondition == io.EOF && qrb.streamRemaining > 0 {
+			qrb.errCondition = io.ErrUnexpectedEOF
 		}
 
 		if qrb.errCondition != nil {
@@ -515,7 +740,14 @@ func (qrb *QuantizedRingBuffer) collector() {
 	}
 }
 
-func (qrb *QuantizedRingBuffer) Stop() (didResultInStop bool) {
+// StopFill is used to shutdown the collector goroutine without having reached
+// an io error on the underlying io.Reader. Calling this function blocks until
+// the collector goroutine exits. Note that if the goroutine is currently busy
+// performing a syscall as part of a Read(), it may take an arbitrarily long
+// amount of time to return. In cases of a blocked system read you will need to
+// arrange for a signal to be delivered to your process, interrupting all
+// syscalls.
+func (qrb *QuantizedRingBuffer) StopFill() (didResultInStop bool) {
 	select {
 
 	case <-qrb.semCollectorDone:
@@ -545,8 +777,30 @@ func (qrb *QuantizedRingBuffer) Stop() (didResultInStop bool) {
 	return
 }
 
-func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
-
+// StartFill is called at the start of every stream-cycle. If readLimit is
+// 0: collector will continue until the underlying io.Reader returns io.EOF.
+// If readLimit is a positive value, the collector will read exactly that many
+// bytes before shutting down. If the underlying reader returns io.EOF before
+// readLimit is reached, NextRegion() will return io.ErrUnexpectedEOF.
+//
+// Note that one can process the same io.Reader (using the same
+// qringbuf/allocation) as multiple sub-streams, as long as the length of each
+// sub-stream is known in advance. For instance, given a reader r, one can do
+// something like:
+//  qrb, err := qringbuf.NewFromReader( r, qringbuf.Config{…} )
+//  for {
+//    var nextSubstreamSize int64
+//    err := binary.Read(
+//      r,
+//      binary.BigEndian,
+//      &nextSubstreamSize,
+//    )
+//    qrb.StartFill( nextSubstreamSize )
+//    for {
+//      … // process sub-stream here, then repeat
+//    }
+//  }
+func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 	// wait until shut down
 	<-qrb.semCollectorDone
 
@@ -560,7 +814,7 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 		qrb.Lock()
 	}
 
-	if qrb.errCondition != io.EOF && qrb.errCondition != ErrStopReceived {
+	if qrb.errCondition != io.EOF && qrb.errCondition != ErrCollectorStopped {
 		// not starting anything - we are already in hard error for the Reader
 		return qrb.errCondition
 	} else if readLimit < 0 {
@@ -633,7 +887,7 @@ func (qrb *QuantizedRingBuffer) Restart(readLimit int64) error {
 }
 
 func (qrb *QuantizedRingBuffer) regionSectors(offset, size int) []*sectorState {
-	if size == 0 || qrb.opts.SectorSize < 0 {
+	if size == 0 {
 		return nil
 	}
 	return qrb.reservationSectors[(offset / qrb.opts.SectorSize):((offset+size-1)/qrb.opts.SectorSize + 1)]
@@ -644,11 +898,6 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 		return 0
 	} else if min > max {
 		max = min
-	}
-
-	// we are not tracking reservations
-	if qrb.opts.SectorSize < 0 {
-		return max
 	}
 
 	if debugReservationsEnabled {
@@ -670,7 +919,7 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 			qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
 		}
 		if stopReceived {
-			qrb.errCondition = ErrStopReceived
+			qrb.errCondition = ErrCollectorStopped
 		}
 	}()
 	if qrb.statsEnabled {
@@ -684,8 +933,7 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 	// that when we are here the emitter is blocked.  Since we
 	// already validated the activeRegion region does not overlap with
 	// anything we will be examining, all we need to check is that
-	// all reserveation sectors have no users, and that we are not
-	// stepping on the wrap-position if any
+	// all reservation sectors have no users.
 	//
 	// It is safe to do this sequentially once per sector, as the
 	// emitter won't advance past us
