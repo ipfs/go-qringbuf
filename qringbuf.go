@@ -6,9 +6,9 @@
 // Specifically an object of this package makes the following guarantees:
 //  • Memory is allocated only at construction time, never during streaming
 //  • StartFill() spawns off a single goroutine (collector) which terminates when:
-//    ◦ It reaches readLimit or receives an expected io.EOF from the wrapped Reader
-//    ◦ Immediately at any other error
-//    ◦ Af the next chance to evaluate a signal received from StopFill()
+//    ◦ It reaches readLimit, if one was supplied
+//    ◦ It receives any error from the wrapped reader (including io.EOF)
+//    ◦ It had a chance to evaluate a signal received from StopFill()
 //      (most io.Read() operations are not cancelable, and may block forever)
 //  • Every call to NextRegion() blocks until it can return:
 //    ◦ A *Region object representing a contiguous slice of at least MinRegion bytes
@@ -128,8 +128,8 @@
 //     30 bytes, NextRegion(6) returns 17 bytes available at the time, 23 total.
 //     Collector keeps reading, until it can no longer satisfy MinRead
 //       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-//                         RRRR  eeeeeeeeeeeeeeeeeeeeeeecccccccccccc|C=59┃
-//                         RRRR  E=24==================<                 ┃
+//       ┋                 RRRR  eeeeeeeeeeeeeeeeeeeeeeecccccccccccc|C=59┃
+//       ┋                 RRRR  E=24==================<                 ┃
 //       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
 //       |0        |10       |20       |30       |40       |50       |60
 //
@@ -155,8 +155,8 @@
 //  ⑥ User recycles 4 bytes, NextRegion(4) serves available 27 bytes, and
 //     the cycle repeats from the top until error or EOF
 //       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-//                     wwwwccccccccccccccccccccccc|C=41                  ┃
-//                     E=14======================<|                      ┃
+//       ┋             wwwwccccccccccccccccccccccc|C=41                  ┃
+//       ┋             E=14======================<|                      ┃
 //       ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
 //       |0        |10       |20       |30       |40       |50       |60
 //
