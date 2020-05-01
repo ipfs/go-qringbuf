@@ -1,22 +1,22 @@
 // Package qringbuf provides a concurrency-friendly zero-copy abstraction of
-// io.ReadAtLeast() over a pre-allocated ring-buffer, populated asynchronously
+// io.ReadAtLeast(…) over a pre-allocated ring-buffer, populated asynchronously
 // by a standalone goroutine. It is primarily designed for processing a series
 // of arbitrary streams each comprised of variable-length records.
 //
 // Specifically an object of this package makes the following guarantees:
 //  • Memory is allocated only at construction time, never during streaming
-//  • StartFill() spawns off a single goroutine (collector) which terminates when:
+//  • StartFill(…) spawns off a single goroutine (collector) which terminates when:
 //    ◦ It reaches readLimit, if one was supplied
 //    ◦ It receives any error from the wrapped reader (including io.EOF)
 //    ◦ It had a chance to evaluate a signal received from StopFill()
 //      (most io.Read() operations are not cancelable, and may block forever)
-//  • Every call to NextRegion() blocks until it can return:
+//  • Every call to NextRegion(…) blocks until it can return:
 //    ◦ A *Region object representing a contiguous slice of at least MinRegion bytes
 //    ◦ A smaller "trailing" *Region and an io.EOF or ErrCollectorStopped
 //    ◦ A nil-Region and any other error
 //  • *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
 //  • Data backing a *Region is guaranteed to remain intact provided:
-//    ◦ NextRegion() has not been called again allowing writes into the buffer
+//    ◦ NextRegion(…) has not been called again allowing writes into the buffer
 //    ◦ *Region.Reserve() was invoked, which blocks writes until a *Region.Release()
 //
 // Examples
@@ -65,13 +65,13 @@
 //
 // In all cases the background collector goroutine reading from *someReader
 // into the ring buffer is guaranteed to:
-//  - never overwrite the buffer portion backing the latest result of NextRegion()
+//  - never overwrite the buffer portion backing the latest result of NextRegion(…)
 //  - never overwrite any buffer portion backing a Reserve()d (Sub)Region
 //
 // Implementation notes
 //
 // Unlike io.ReadAtLeast, errors from the underlying reader are always made
-// available on NextRegion(). As with the standard io.* semantics an error can
+// available on NextRegion(…). As with the standard io.* semantics an error can
 // be returned together with a result. One should always check whether the
 // *Region return value is nil first, before processing the error,
 //
@@ -87,7 +87,7 @@
 //
 // The reservation system explicitly allows "recursive locking": you can hold
 // an arbitrary number of reservations over a sector by repeatedly creating
-// SubRegion() objects. Care must be taken to release every single reservation
+// SubRegion(…) objects. Care must be taken to release every single reservation
 // obtained previously, otherwise the collector will remain blocked forever.
 //
 // Here is an illustration of a qringbuf object lifecycle initialized with
@@ -100,7 +100,7 @@
 // ·
 //
 //  † C is the collector position: the *end* of the most recent read from the underlying io.Reader
-//    E is the emitter position: the *start* of the most recently returned NextRegion()
+//    E is the emitter position: the *start* of the most recently returned NextRegion(…)
 //    W is the last value of "E" before a wrap took place, 0 otherwise
 //
 //  ⓪ Buffer initialized, StartFill(…) is called.
@@ -146,7 +146,7 @@
 //       |0        |10       |20       |30       |40       |50       |60
 //
 //  ⑤ The async job finishes, reservation is released, collector can now
-//     advance further, and blocks again as NextRegion() has not been called
+//     advance further, and blocks again as NextRegion(…) has not been called
 //     meaning the last 18 bytes are still being processed.
 //       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
 //       W=41wwwwwwwwwwwwwwccccccccccccccccccccccc|C=41|eeeeeeeeeeee|    ┃
@@ -180,16 +180,16 @@ const (
 	impossibleStreamLimitText string = "over 4 terabytes"
 )
 
-// ErrCollectorStopped is the error returned by NextRegion() before the
-// background collector goroutine has been started with StartFill(), or
+// ErrCollectorStopped is the error returned by NextRegion(…) before the
+// background collector goroutine has been started with StartFill(…), or
 // after StopFill() has been called explicitly. Note that when a readLimit
-// supplied to StartFill() is reached, and the collector stops on its own,
-// the error state is io.EOF or io.ErrUnexpectedEOF
+// supplied to StartFill(…) is reached, and the collector stops on its own,
+// the error state is either io.EOF or io.ErrUnexpectedEOF
 var ErrCollectorStopped error = errors.New("collector stopped")
 
 // Region is an object representing a part of the buffer. Initially a *Region
-// is obtained by calling NextRegion(), but then one can subdivide a *Region
-// object into smaller portions via SubRegion().
+// is obtained by calling NextRegion(…), but then one can subdivide a *Region
+// object into smaller portions via SubRegion(…).
 type Region struct {
 	reserved int32
 	gen      int
@@ -205,7 +205,7 @@ func (r *Region) Size() int { return r.size }
 
 // Bytes returns a slice of the underlying ring buffer. One should take care
 // to copy or finish using the returned slice before making another call to
-// NextRegion(). If Reserve() has been invoked, then the slice is guaranteed
+// NextRegion(…). If Reserve() has been invoked, then the slice is guaranteed
 // to remain intact before the corresponding Release() call.
 func (r *Region) Bytes() []byte { return r.qrb.buf[r.offset : r.offset+r.size] }
 
@@ -234,7 +234,7 @@ func (r *Region) SubRegion(offset, length int) *Region {
 // Reserve marks the buffer area backing this *Region object as a "no-write"
 // zone, until the corresponding Release() has been called. Losing a Reserve()d
 // *Region object before calling Release() will lead to a deadlock: neither
-// NextRegion() nor the collector will be able to proceed beyond the point
+// NextRegion(…) nor the collector will be able to proceed beyond the point
 // now-forever reserved. Calling Reserve() more than once on the same object
 // results in log.Panic()
 func (r *Region) Reserve() {
@@ -288,7 +288,7 @@ func (r *Region) Release() {
 // that passing a reference to a *Stats structure will incur a penalty, mainly
 // from repeatedly calling time.Now()
 type Config struct {
-	MinRegion  int // [1:…] Any result of NextRegion() is guaranteed to be at least that many bytes long, except at EOF
+	MinRegion  int // [1:…] Any result of NextRegion(…) is guaranteed to be at least that many bytes long, except at EOF
 	MinRead    int // [1:MinRegion] Do not read data from io.Reader until buffer has space to store that many bytes
 	BufferSize int // [MinRead+2*MinRegion:…] Size of the allocated buffer in bytes
 	MaxCopy    int // [MinRegion:BufferSize/2] Delay "wrap around" until amount of data to copy falls under this threshold
@@ -458,7 +458,7 @@ func (qrb *QuantizedRingBuffer) signalCond(c chan<- struct{}) {
 }
 
 // Buffered returns the current amount of data already read from the underlying
-// reader, but not yet served via NextRegion(). It is primarily useful for
+// reader, but not yet served via NextRegion(…). It is primarily useful for
 // informative error messages:
 //
 //  if err == io.ErrUnexpectedEOF {
@@ -593,7 +593,6 @@ func (qrb *QuantizedRingBuffer) collector() {
 	spaceWaitLoop:
 		// INNER spaceWaitLoop START
 		for {
-
 			if qrb.cPos < qrb.ePos {
 				log.Panicf(
 					"collector is behind emitter, this is not possible\tePos:%d\tcPos:%d\tbufSize:%d\tcurRegSize:%d",
@@ -749,7 +748,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 // StopFill is used to shutdown the collector goroutine without having reached
 // an io error on the underlying io.Reader. Calling this function blocks until
 // the collector goroutine exits. Note that if the goroutine is currently busy
-// performing a syscall as part of a Read(), it may take an arbitrarily long
+// performing a syscall as part of a Read(…), it may take an arbitrarily long
 // amount of time to return. In cases of a blocked system read you will need to
 // arrange for a signal to be delivered to your process, interrupting all
 // syscalls.
@@ -787,7 +786,7 @@ func (qrb *QuantizedRingBuffer) StopFill() (didResultInStop bool) {
 // 0: collector will continue until the underlying io.Reader returns io.EOF.
 // If readLimit is a positive value, the collector will read exactly that many
 // bytes before shutting down. If the underlying reader returns io.EOF before
-// readLimit is reached, NextRegion() will return io.ErrUnexpectedEOF.
+// readLimit is reached, NextRegion(…) will return io.ErrUnexpectedEOF.
 //
 // Note that one can process the same io.Reader (using the same
 // qringbuf/allocation) as multiple sub-streams, as long as the length of each
