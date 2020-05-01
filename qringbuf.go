@@ -31,12 +31,14 @@
 //  …
 //  var available, processed int
 //  for {
+//      // Reevaluate available and processed from the *previous* round,
+//      // indicating how much has NOT been processed, and needs re-serving
 //      reg, streamErr := qrb.NextRegion( available - processed )
 //      if reg == nil {
 //          return streamErr
 //      }
 //
-//      // work with region, processing all or just a portion of the data
+//      // Work with region, processing all or just a portion of the data
 //      available = reg.Size()
 //      processed = frobnicate( reg.Bytes(), … )
 //  }
@@ -47,20 +49,24 @@
 //  …
 //  var available, processed int
 //  for {
+//      // Reevaluate available and processed from the *previous* round,
+//      // indicating how much has NOT been processed, and needs re-serving
 //      reg, streamErr := qrb.NextRegion( available - processed )
 //      if reg == nil {
 //          return streamErr
 //      }
 //
 //      available = reg.Size()
-//      processed = 256
+//      if available > 256 {
+//          reg = reg.SubRegion( 0, 256 )
+//      }
 //
-//      subReg := reg.SubRegion( 0, 256 )
-//      subReg.Reserve()
+//      reg.Reserve()
+//      processed = reg.Size()
 //
 //      go func() {
-//          frobnicate( subReg.Bytes(), … )
-//          subReg.Release()
+//          frobnicate( reg.Bytes(), … )
+//          reg.Release()
 //      }()
 //  }
 //
@@ -293,7 +299,7 @@ type Config struct {
 	MinRead    int // [1:MinRegion] Do not read data from io.Reader until buffer has space to store that many bytes
 	BufferSize int // [MinRead+2*MinRegion:…] Size of the allocated buffer in bytes
 	MaxCopy    int // [MinRegion:BufferSize/2] Delay "wrap around" until amount of data to copy falls under this threshold
-	SectorSize int // [4096:BufferSize/3] Size of each occupancy sector for region.{Reserve|Release}() tracking
+	SectorSize int // [4096:BufferSize/3] Size of each occupancy sector for *Region.{Reserve|Release}() tracking
 	Stats      *Stats
 }
 
