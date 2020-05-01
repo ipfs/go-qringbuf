@@ -103,14 +103,24 @@
 // SubRegion(…) objects. Care must be taken to release every single reservation
 // obtained previously, otherwise the collector will remain blocked forever.
 //
-// Here is an illustration of a qringbuf object lifecycle initialized with
-//  {
+// Follows an illustration of a contrived lifecycle of a hypothetical qringbuf
+// object initialized with:
+//  qringbuf.Config{
 //    BufferSize: 64,
 //    MinRegion:  16,
 //    MinRead:    8,
 //    MaxCopy     24,
 //  }
-// ·
+//
+// Note that for brevity THE DIAGRAMS BELOW ARE DECIDEDLY NOT REPRESENTATIVE
+// of a typical lifecycle. Normally BufferSize is an order of magnitude larger
+// than MinRegion and MaxCopy, and the time spent waiting and copying data
+// is insignificant in relation to all other possible states. Also outstanding
+// async reservations typically trail the emitter very closely, so after a
+// wrap the collector is virtually never blocked, contrary to what is depicted
+// below. Instead the diagrams merely demonstrate the choices this library
+// makes dealing with the "tricky parts" of maintaining the illusion of an
+// arbitrary stream of contiguous bytes.
 //
 //  † C is the collector position: the *end* of the most recent read from the underlying io.Reader
 //    E is the emitter position: the *start* of the most recently returned NextRegion(…)
