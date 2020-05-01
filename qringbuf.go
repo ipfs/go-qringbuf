@@ -811,11 +811,11 @@ func (qrb *QuantizedRingBuffer) StopFill() (didResultInStop bool) {
 // bytes before shutting down. If the underlying reader returns io.EOF before
 // readLimit is reached, NextRegion(…) will return io.ErrUnexpectedEOF.
 //
-// Note that one can process the same io.Reader as multiple substreams, using
-// the same qringbuf object and buffer allocation. All you need is the ability
-// to determine the length of each sub-stream in advance. For instance, given
-// a reader r into a stream of SInt64-length-prefixed sub-streams, one can do
-// something like:
+// Note that one can process the same io.Reader as multiple consecutive
+// sub-streams, using the same qringbuf object and buffer allocation. All you
+// need is the ability to determine the length of each sub-stream in advance.
+// For instance, given a reader r into a stream of SInt64-length-prefixed
+// sub-streams, one can do something like:
 //  qrb, err := qringbuf.NewFromReader( r, qringbuf.Config{…} )
 //  for {
 //    var nextSubstreamSize int64
