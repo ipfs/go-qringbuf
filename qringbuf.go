@@ -346,7 +346,7 @@ type QuantizedRingBuffer struct {
 	// Think of them as very specialized, internal-only ctx, that exist to correctly
 	// mesh with the select()s waiting on the "cond-channels" above
 	//
-	// They are initialized anew on every Restart(), never receive any values,
+	// They are initialized anew on every StartFill(), never receive any values,
 	// and are closed in definition-order when a stop condition arises
 	semStopCollector chan struct{}
 	semCollectorDone chan struct{}
@@ -514,7 +514,7 @@ func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err 
 	}
 	qrb.wrapPos = 0 // regardles whether was set or not
 	qrb.ePos += qrb.curRegionSize - regionRemainder
-	qrb.curRegionSize = 0 // when collector is finished, this signals drain-end for Restart()
+	qrb.curRegionSize = 0 // when collector is finished, this signals drain-end for another potential StartFill()
 	qrb.signalCond(qrb.condEmitterChange)
 
 	// Wait ( collector moves our start pos on wraparound ) while:
