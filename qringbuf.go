@@ -1,7 +1,8 @@
 // Package qringbuf provides a concurrency-friendly zero-copy abstraction of
 // io.ReadAtLeast(…) over a pre-allocated ring-buffer, populated asynchronously
 // by a standalone goroutine. It is primarily designed for processing a series
-// of arbitrary streams each comprised of variable-length records.
+// of arbitrary streams each comprised of variable-length records. See the
+// Examples section and the additional example at StartFill(…) further down.
 //
 // Specifically an object of this package makes the following guarantees:
 //  • Memory is allocated only at construction time, never during streaming
@@ -782,15 +783,16 @@ func (qrb *QuantizedRingBuffer) StopFill() (didResultInStop bool) {
 	return
 }
 
-// StartFill is called at the start of every stream-cycle. If readLimit is
-// 0: collector will continue until the underlying io.Reader returns io.EOF.
+// StartFill is called at the start of every stream-cycle. If readLimit is 0
+// collector will continue until the underlying io.Reader returns io.EOF.
 // If readLimit is a positive value, the collector will read exactly that many
 // bytes before shutting down. If the underlying reader returns io.EOF before
 // readLimit is reached, NextRegion(…) will return io.ErrUnexpectedEOF.
 //
-// Note that one can process the same io.Reader (using the same
-// qringbuf/allocation) as multiple sub-streams, as long as the length of each
-// sub-stream is known in advance. For instance, given a reader r, one can do
+// Note that one can process the same io.Reader as multiple substreams, using
+// the same qringbuf object and buffer allocation. All you need is the ability
+// to determine the length of each sub-stream in advance. For instance, given
+// a reader r into a stream of SInt64-length-prefixed sub-streams, one can do
 // something like:
 //  qrb, err := qringbuf.NewFromReader( r, qringbuf.Config{…} )
 //  for {
@@ -802,7 +804,7 @@ func (qrb *QuantizedRingBuffer) StopFill() (didResultInStop bool) {
 //    )
 //    qrb.StartFill( nextSubstreamSize )
 //    for {
-//      … // process sub-stream here, then repeat
+//      // process sub-stream until io.EOF as shown in Examples, then repeat
 //    }
 //  }
 func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
