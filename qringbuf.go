@@ -12,12 +12,12 @@
 //    ◦ It had a chance to evaluate a signal received from StopFill()
 //      (most io.Read() operations are not cancelable, and may block forever)
 //  • Every call to NextRegion(…) blocks until it can return:
-//    ◦ A *Region object representing a contiguous slice of at least MinRegion bytes
-//    ◦ A smaller "trailing" *Region and an io.EOF or ErrCollectorStopped
-//    ◦ A nil-Region and any other error
+//    ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
+//    ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
+//    ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
 //  • *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
-//  • Data backing a *Region is guaranteed to remain intact provided:
-//    ◦ NextRegion(…) has not been called again allowing writes into the buffer
+//  • Data backing a *Region is guaranteed to remain available / not be overwritten provided:
+//    ◦ NextRegion(…) has not been called again allowing further writes into the buffer
 //    ◦ *Region.Reserve() was invoked, which blocks writes until a *Region.Release()
 //
 // Examples
@@ -34,7 +34,10 @@
 //      // Reevaluate available and processed from the *previous* round,
 //      // indicating how much has NOT been processed, and needs re-serving
 //      reg, streamErr := qrb.NextRegion( available - processed )
-//      if reg == nil {
+//
+//      // io.EOF only means the collector stopped: there could be up to
+//      // BufferSize bytes remaining in the buffer. Loop until reg is nil
+//      if ( streamErr != nil && streamErr != io.EOF ) || reg == nil {
 //          return streamErr
 //      }
 //
@@ -52,7 +55,10 @@
 //      // Reevaluate available and processed from the *previous* round,
 //      // indicating how much has NOT been processed, and needs re-serving
 //      reg, streamErr := qrb.NextRegion( available - processed )
-//      if reg == nil {
+//
+//      // io.EOF only means the collector stopped: there could be up to
+//      // BufferSize bytes remaining in the buffer. Loop until reg is nil
+//      if ( streamErr != nil && streamErr != io.EOF ) || reg == nil {
 //          return streamErr
 //      }
 //
@@ -482,11 +488,26 @@ func (qrb *QuantizedRingBuffer) Buffered() int {
 }
 
 // NextRegion returns a *Region object representing a portion of the underlying
-// stream. You can explicitly request overlapping *Region's by supplying the
-// number of bytes to "step back". This is especially useful when processing a
-// stream of variable-length records where the only information you have is the
-// maximum size of a record. By initializing your qringbuf with MinRegion equal
-// to this maximum value, you guarantee never experiencing an under-read.
+// stream. One can explicitly request overlapping *Region's by supplying the
+// number of bytes to "step back" (use 0 for "just give me what's next"). This
+// functionality is especially useful when processing variable-length records
+// where the only information you have is the maximum size of a record. By
+// initializing your qringbuf with MinRegion equal to this maximum value, you
+// guarantee never experiencing a "short-read".
+//
+// Every call to NextRegion(…) blocks until it can return:
+//  ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
+//  ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
+//  ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
+//
+// Any error encountered on the underlying io.Reader, including io.EOF, is
+// returned on every subsequent NextRegion(…) call, often combined with a
+// *Region object representing data still remaining in the ring buffer. The
+// interface follows the model of io.Reader, requiring the user to not only
+// check for errors, but also observe whether data was made available. See the
+// Examples for the typical loop-termination condition and the error handling
+// discussion at https://pkg.go.dev/io?tab=doc#Reader (2nd and 3rd paragraphs)
+//
 // Each call to NextRegion must advance the stream by at least a single byte:
 // calling NextRegion with regionRemainder equal or larger than Size() of the
 // last *Region results in log.Panic()
@@ -551,15 +572,10 @@ waitOnCollector:
 		}
 	}
 
-	if qrb.errCondition != nil {
-		if qrb.ePos < qrb.cPos &&
-			(qrb.errCondition == io.EOF ||
-				qrb.errCondition == ErrCollectorStopped) {
-			// not yet done with what the collector left us
-			// return the remaining range at the end
-		} else {
-			return nil, qrb.errCondition
-		}
+	// nothing remains in the buffer we are done for this cycle for good
+	// (if more data was coming: we would not have broken out of above loop)
+	if qrb.ePos == qrb.cPos {
+		return nil, qrb.errCondition
 	}
 
 	qrb.gen++ // counter separate from the stats, for mis-reservation errors
