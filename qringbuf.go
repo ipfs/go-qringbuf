@@ -307,16 +307,15 @@ func (r *Region) Release() {
 	r.qrb.signalCond(r.qrb.condReservationRelease)
 }
 
-// Config is the structure of options expected at initialization time. Note
-// that passing a reference to a *Stats structure will incur a penalty, mainly
-// from repeatedly calling time.Now()
+// Config is the structure of options expected at initialization time.
 type Config struct {
-	MinRegion  int // [1:…] Any result of NextRegion(…) is guaranteed to be at least that many bytes long, except at EOF
-	MinRead    int // [1:MinRegion] Do not read data from io.Reader until buffer has space to store that many bytes
-	BufferSize int // [MinRead+2*MinRegion:…] Size of the allocated buffer in bytes
-	MaxCopy    int // [MinRegion:BufferSize/2] Delay "wrap around" until amount of data to copy falls under this threshold
-	SectorSize int // [4096:BufferSize/3] Size of each occupancy sector for *Region.{Reserve|Release}() tracking
-	Stats      *Stats
+	MinRegion   int // [1:…] Any result of NextRegion(…) is guaranteed to be at least that many bytes long, except at EOF
+	MinRead     int // [1:MinRegion] Do not read data from io.Reader until buffer has space to store that many bytes
+	BufferSize  int // [MinRead+2*MinRegion:…] Size of the allocated buffer in bytes
+	MaxCopy     int // [MinRegion:BufferSize/2] Delay "wrap around" until amount of data to copy falls under this threshold
+	SectorSize  int // [4096:BufferSize/3] Size of each occupancy sector for *Region.{Reserve|Release}() tracking
+	Stats       *Stats
+	TrackTiming bool // When a Stats structure is provided, record timing of operations in addition to counts
 }
 
 type QuantizedRingBuffer struct {
@@ -380,8 +379,8 @@ type QuantizedRingBuffer struct {
 // of the qringbuf object lifetime. In order to obtain a consistent read of
 // the stats values, either the collector should have terminated, or you should
 // obtain a Lock() before accessing the structure.
-// Note that collecting these stats will incur a performance penalty, mainly
-// due to the repeated calls to time.Now()
+// Note that collecting timings is disabled by default, due to the non-trivial
+// cost of time.Now(). Toggle the boolean Config.TrackTiming to enable.
 type Stats struct {
 	ReadCalls                int64 `json:"readCalls"`
 	CollectorYields          int64 `json:"collectorYields"`
@@ -455,6 +454,10 @@ func NewFromReader(
 	close(qrb.semStopCollector)
 	close(qrb.semCollectorDone)
 
+	if !qrb.statsEnabled {
+		qrb.opts.TrackTiming = false
+	}
+
 	sectorCount := cfg.BufferSize / cfg.SectorSize
 	// silliness to avoid invoking math.Ceil
 	if cfg.BufferSize%cfg.SectorSize != 0 {
@@ -525,12 +528,14 @@ func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err 
 	var t0 time.Time
 
 	defer qrb.Unlock()
-	if qrb.statsEnabled {
+	if qrb.opts.TrackTiming {
 		t0 = time.Now()
 	}
 	qrb.Lock()
 	if qrb.statsEnabled {
-		qrb.opts.Stats.EmitterWaitNanoseconds += time.Since(t0).Nanoseconds()
+		if qrb.opts.TrackTiming {
+			qrb.opts.Stats.EmitterWaitNanoseconds += time.Since(t0).Nanoseconds()
+		}
 		qrb.opts.Stats.NextRegionCalls++
 	}
 
@@ -562,7 +567,9 @@ waitOnCollector:
 	for qrb.errCondition == nil && qrb.ePos+qrb.opts.MinRegion > qrb.cPos {
 		if qrb.statsEnabled {
 			qrb.opts.Stats.EmitterYields++
-			t0 = time.Now()
+			if qrb.opts.TrackTiming {
+				t0 = time.Now()
+			}
 		}
 		qrb.Unlock()
 		select {
@@ -571,13 +578,13 @@ waitOnCollector:
 		case <-qrb.semCollectorDone:
 			// when we are done - we are done
 			qrb.Lock()
-			if qrb.statsEnabled {
+			if qrb.opts.TrackTiming {
 				qrb.opts.Stats.EmitterWaitNanoseconds += time.Since(t0).Nanoseconds()
 			}
 			break waitOnCollector
 		}
 		qrb.Lock()
-		if qrb.statsEnabled {
+		if qrb.opts.TrackTiming {
 			qrb.opts.Stats.EmitterWaitNanoseconds += time.Since(t0).Nanoseconds()
 		}
 	}
@@ -612,14 +619,14 @@ func (qrb *QuantizedRingBuffer) collector() {
 	var t0 time.Time
 
 	for {
-		if qrb.statsEnabled {
+		if qrb.opts.TrackTiming {
 			t0 = time.Now()
 		}
 		// Lock() and Unlock() repeatedly every time we loop through this outer
 		// scope. Provides one more point (aside from the wait's below) for the
 		// emitter side to begin dispensing regions to the end-user
 		qrb.Lock()
-		if qrb.statsEnabled {
+		if qrb.opts.TrackTiming {
 			qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
 		}
 
@@ -693,7 +700,9 @@ func (qrb *QuantizedRingBuffer) collector() {
 
 			if qrb.statsEnabled {
 				qrb.opts.Stats.CollectorYields++
-				t0 = time.Now()
+				if qrb.opts.TrackTiming {
+					t0 = time.Now()
+				}
 			}
 			qrb.Unlock()
 			select {
@@ -701,7 +710,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 				// just waiting, nothing to do
 			case <-qrb.semStopCollector:
 				qrb.Lock()
-				if qrb.statsEnabled {
+				if qrb.opts.TrackTiming {
 					qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
 				}
 				qrb.errCondition = ErrCollectorStopped
@@ -709,7 +718,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 				return
 			}
 			qrb.Lock()
-			if qrb.statsEnabled {
+			if qrb.opts.TrackTiming {
 				qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
 			}
 		}
@@ -918,7 +927,7 @@ func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 	// 			qrb.curRegionSize,
 	// 		)
 	// 		p, _ := os.FindProcess(os.Getpid())
-	// 		p.Signal(syscall.SIGQUIT)
+	// 		p.Signal(unix.SIGQUIT)
 	// 	}
 	// }()
 
@@ -954,14 +963,14 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 	qrb.Unlock()
 	defer func() {
 		qrb.Lock()
-		if qrb.statsEnabled {
+		if qrb.opts.TrackTiming {
 			qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
 		}
 		if stopReceived {
 			qrb.errCondition = ErrCollectorStopped
 		}
 	}()
-	if qrb.statsEnabled {
+	if qrb.opts.TrackTiming {
 		t0 = time.Now()
 	}
 
