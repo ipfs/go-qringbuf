@@ -258,7 +258,8 @@ an out of bounds re-slice results in log.Panic(). As a special case one can
 	clone := region.SubRegion( 0, region.Size() )
 */
 func (r *Region) SubRegion(offset, length int) *Region {
-	if offset < 0 || length <= 0 || offset+length > r.size {
+	if sanityChecksEnabled &&
+		(offset < 0 || length <= 0 || offset+length > r.size) {
 		log.Panicf(
 			"subregion bounds out of range [%d:%d] with capacity %d",
 			offset,
@@ -284,21 +285,24 @@ now-forever reserved. Calling Reserve() more than once on the same object
 results in log.Panic()
 */
 func (r *Region) Reserve() {
-	if atomic.AddInt32(&r.reserved, 1) != 1 {
-		log.Panicf(
-			"double-reservation of region %T(%p) [%d:%d]",
-			r, &r,
-			r.offset, r.offset+r.size,
-		)
-	} else if r.gen != r.qrb.gen {
-		log.Panic("only regions obtained from the most recent NextRegion() call can be reserved")
+	if sanityChecksEnabled {
+		if atomic.AddInt32(&r.reserved, 1) != 1 {
+			log.Panicf(
+				"double-reservation of region %T(%p) [%d:%d]",
+				r, &r,
+				r.offset, r.offset+r.size,
+			)
+		} else if r.gen != r.qrb.gen {
+			log.Panic("only regions obtained from the most recent NextRegion() call can be reserved")
+		}
 	}
 
 	if debugReservationsEnabled {
 		debugReservations(" reserve [%9d:%9d]", r.offset, r.offset+r.size)
 	}
-	for _, s := range r.qrb.regionSectors(r.offset, r.size) {
-		atomic.AddInt32(&s.userCount, 1)
+	rs := r.qrb.regionSectors(r.offset, r.size)
+	for i := range rs {
+		atomic.AddInt32(rs[i].userCount, 1)
 	}
 	if debugReservationsEnabled {
 		debugReservations("reserved [%9d:%9d]", r.offset, r.offset+r.size)
@@ -311,7 +315,8 @@ a previous Reserve() call. Calling Release() more than once on the same
 object, or before Reserve() has been called, results in log.Panic()
 */
 func (r *Region) Release() {
-	if atomic.AddInt32(&r.reserved, -1) != 0 {
+	if sanityChecksEnabled &&
+		atomic.AddInt32(&r.reserved, -1) != 0 {
 		log.Panicf(
 			"double-free of region %T(%p) [%d:%d]",
 			r, &r,
@@ -322,8 +327,9 @@ func (r *Region) Release() {
 	if debugReservationsEnabled {
 		debugReservations(" release [%9d:%9d]", r.offset, r.offset+r.size)
 	}
-	for _, s := range r.qrb.regionSectors(r.offset, r.size) {
-		atomic.AddInt32(&s.userCount, -1)
+	rs := r.qrb.regionSectors(r.offset, r.size)
+	for i := range rs {
+		atomic.AddInt32(rs[i].userCount, -1)
 	}
 	if debugReservationsEnabled {
 		debugReservations("released [%9d:%9d]", r.offset, r.offset+r.size)
@@ -354,7 +360,7 @@ type QuantizedRingBuffer struct {
 	curRegionSize      int
 	gen                int
 	buf                []byte
-	reservationSectors []*sectorState
+	reservationSectors []sectorState
 	errCondition       error
 	statsEnabled       bool
 
@@ -415,9 +421,8 @@ type Stats struct {
 }
 
 type sectorState struct {
-	userCount       int32
-	thisSectorStart int
-	nextSectorStart int
+	sectorOffset int
+	userCount    *int32
 }
 
 func NewFromReader(
@@ -485,13 +490,10 @@ func NewFromReader(
 	if cfg.BufferSize%cfg.SectorSize != 0 {
 		sectorCount++
 	}
-	qrb.reservationSectors = make([]*sectorState, sectorCount)
-	for sectorCount > 0 {
-		sectorCount--
-		qrb.reservationSectors[sectorCount] = &sectorState{
-			thisSectorStart: cfg.SectorSize * sectorCount,
-			nextSectorStart: cfg.SectorSize * (sectorCount + 1),
-		}
+	qrb.reservationSectors = make([]sectorState, sectorCount)
+	for i := range qrb.reservationSectors {
+		qrb.reservationSectors[i].sectorOffset = cfg.SectorSize * i
+		qrb.reservationSectors[i].userCount = new(int32)
 	}
 
 	return qrb, nil
@@ -550,7 +552,7 @@ Each call to NextRegion must advance the stream by at least a single byte:
 calling NextRegion with regionRemainder equal or larger than Size() of the
 last *Region results in log.Panic()
 */
-func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err error) {
+func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (*Region, error) {
 	var t0 time.Time
 
 	defer qrb.Unlock()
@@ -565,17 +567,19 @@ func (qrb *QuantizedRingBuffer) NextRegion(regionRemainder int) (r *Region, err 
 		qrb.opts.Stats.NextRegionCalls++
 	}
 
-	if regionRemainder < 0 {
-		log.Panicf(
-			"supplied invalid negative remainder %d",
-			regionRemainder,
-		)
-	} else if regionRemainder != 0 &&
-		regionRemainder >= qrb.curRegionSize {
-		log.Panicf(
-			"supplied remainder %d must be smaller than the %d obtained from the last NextRegion() call",
-			regionRemainder, qrb.curRegionSize,
-		)
+	if sanityChecksEnabled {
+		if regionRemainder < 0 {
+			log.Panicf(
+				"supplied invalid negative remainder %d",
+				regionRemainder,
+			)
+		} else if regionRemainder != 0 &&
+			regionRemainder >= qrb.curRegionSize {
+			log.Panicf(
+				"supplied remainder %d must be smaller than the %d obtained from the last NextRegion() call",
+				regionRemainder, qrb.curRegionSize,
+			)
+		}
 	}
 
 	if debugReservationsEnabled && qrb.curRegionSize > 0 {
@@ -626,6 +630,7 @@ waitOnCollector:
 	if debugReservationsEnabled {
 		debugReservations("    held [%9d:%9d]", qrb.ePos, qrb.ePos+qrb.curRegionSize)
 	}
+
 	return &Region{
 		offset: qrb.ePos,
 		size:   qrb.curRegionSize,
@@ -659,7 +664,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 	spaceWaitLoop:
 		// INNER spaceWaitLoop START
 		for {
-			if qrb.cPos < qrb.ePos {
+			if sanityChecksEnabled && qrb.cPos < qrb.ePos {
 				log.Panicf(
 					"collector is behind emitter, this is not possible\tePos:%d\tcPos:%d\tbufSize:%d\tcurRegSize:%d",
 					qrb.ePos,
@@ -907,7 +912,7 @@ func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 	return nil
 }
 
-func (qrb *QuantizedRingBuffer) regionSectors(offset, size int) []*sectorState {
+func (qrb *QuantizedRingBuffer) regionSectors(offset, size int) []sectorState {
 	if size == 0 {
 		return nil
 	}
@@ -954,9 +959,9 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 	//
 	// It is safe to do this sequentially once per sector, as the
 	// emitter won't advance past us
-	for _, s := range qrb.regionSectors(offset, max) {
-
-		for atomic.LoadInt32(&s.userCount) != 0 {
+	rs := qrb.regionSectors(offset, max)
+	for i := range rs {
+		for atomic.LoadInt32(rs[i].userCount) != 0 {
 
 			// we are about to block - bail if we are happy
 			if available >= min {
@@ -969,11 +974,11 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 			}
 		}
 
-		// sector is free for our purposes \o/
-		if offset > s.thisSectorStart {
-			available += (s.nextSectorStart - offset)
-		} else {
-			available += qrb.opts.SectorSize
+		// we got that far - sector is free for our purposes \o/
+
+		available += qrb.opts.SectorSize
+		if offset > rs[i].sectorOffset {
+			available -= (offset - rs[i].sectorOffset)
 		}
 
 		if available > max {
@@ -1007,11 +1012,13 @@ done
 const debugReservationsEnabled bool = false
 
 func debugReservations(f string, a ...interface{}) {
-	fmt.Printf(
-		"%-54s"+f+"\n",
-		append(
-			[]interface{}{time.Now()},
-			a...,
-		)...,
-	)
+	if debugReservationsEnabled {
+		fmt.Printf(
+			"%-54s"+f+"\n",
+			append(
+				[]interface{}{time.Now()},
+				a...,
+			)...,
+		)
+	}
 }
