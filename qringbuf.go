@@ -846,6 +846,14 @@ func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 	qrb.Lock()
 	defer qrb.Unlock()
 
+	// If in error - we *could* race here on shutdown, wait for things to terminate fully
+	// If in normal operation - just error out below
+	if qrb.errCondition != nil {
+		qrb.Unlock()
+		<-qrb.semCollectorDone
+		qrb.Lock()
+	}
+
 	if qrb.IsCollectorRunning() {
 		return errors.New(
 			"start failed: collector still running from previous cycle",
