@@ -646,6 +646,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 		qrb.signalCond(qrb.condCollectorChange) // one last signal, emitter won't wait after above closes
 	}()
 
+	var readErr error
 	var mustRead, couldRead, didRead int
 	var t0 time.Time
 
@@ -763,7 +764,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 		if debugReservationsEnabled {
 			debugReservations(" writing [%9d:%9d]", qrb.cPos, qrb.cPos+couldRead)
 		}
-		didRead, qrb.errCondition = qrb.reader.Read(
+		didRead, readErr = qrb.reader.Read(
 			qrb.buf[qrb.cPos : qrb.cPos+couldRead],
 		)
 		if debugReservationsEnabled {
@@ -781,14 +782,16 @@ func (qrb *QuantizedRingBuffer) collector() {
 			qrb.cPos += didRead
 			qrb.streamRemaining -= int64(didRead)
 			qrb.signalCond(qrb.condCollectorChange)
-		} else if qrb.errCondition == nil {
+		} else if readErr == nil {
 			log.Panic("zero-size read without a raised error")
 		}
 
-		if qrb.errCondition == nil && qrb.streamRemaining == 0 {
+		if readErr == nil && qrb.streamRemaining == 0 {
 			qrb.errCondition = io.EOF
-		} else if qrb.errCondition == io.EOF && qrb.streamRemaining > 0 {
+		} else if readErr == io.EOF && qrb.streamRemaining > 0 {
 			qrb.errCondition = io.ErrUnexpectedEOF
+		} else {
+			qrb.errCondition = readErr
 		}
 
 		if qrb.errCondition != nil {
