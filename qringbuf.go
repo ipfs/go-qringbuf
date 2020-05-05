@@ -10,8 +10,6 @@ Specifically an object of this package makes the following guarantees:
  • StartFill(…) spawns off a single goroutine (collector) which terminates when:
    ◦ It reaches readLimit, if one was supplied
    ◦ It receives any error from the wrapped reader (including io.EOF)
-   ◦ It had a chance to evaluate a signal received from StopFill()
-     (most io.Read() operations are not cancelable, and may block forever)
  • Every call to NextRegion(…) blocks until it can return:
    ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
    ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
@@ -190,7 +188,6 @@ arbitrary stream of contiguous bytes.
 package qringbuf
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -203,15 +200,6 @@ const (
 	impossibleStreamLimit     int64  = 1 << 42
 	impossibleStreamLimitText string = "over 4 terabytes"
 )
-
-/*
-ErrCollectorStopped is the error returned by NextRegion(…) before the
-background collector goroutine has been started with StartFill(…), or
-after StopFill() has been called explicitly. Note that when a readLimit
-supplied to StartFill(…) is reached, and the collector stops on its own,
-the error state is either io.EOF or io.ErrUnexpectedEOF
-*/
-var ErrCollectorStopped error = errors.New("collector stopped")
 
 /*
 Region is an object representing a part of the buffer. Initially a *Region
@@ -380,13 +368,9 @@ type QuantizedRingBuffer struct {
 	condCollectorChange chan struct{}
 	condEmitterChange   chan struct{}
 
-	// This pair of channels implements stop/end semaphores for the collector goroutine
-	// Think of them as very specialized, internal-only ctx, that exist to correctly
-	// mesh with the select()s waiting on the "cond-channels" above
-	//
-	// They are initialized anew on every StartFill(), never receive any values,
-	// and are closed in definition-order when a stop condition arises
-	semStopCollector chan struct{}
+	// This channel implements an end semaphore of the collector goroutine
+	// It is initialized anew on every StartFill(), never receives any values,
+	// and is closed when the collector terminates.
 	semCollectorDone chan struct{}
 }
 
@@ -460,8 +444,7 @@ func NewFromReader(
 		opts:             cfg,
 		statsEnabled:     (cfg.Stats != nil),
 		buf:              make([]byte, cfg.BufferSize),
-		errCondition:     ErrCollectorStopped,
-		semStopCollector: make(chan struct{}),
+		errCondition:     io.EOF,
 		semCollectorDone: make(chan struct{}),
 
 		// never close these, they replace sync.Cond's
@@ -469,7 +452,6 @@ func NewFromReader(
 		condCollectorChange:    make(chan struct{}, 1),
 		condEmitterChange:      make(chan struct{}, 1),
 	}
-	close(qrb.semStopCollector)
 	close(qrb.semCollectorDone)
 
 	if !qrb.statsEnabled {
@@ -689,10 +671,6 @@ func (qrb *QuantizedRingBuffer) collector() {
 				// is copy what's available, move emitter to 0, move us to
 				// the copy-end and proceed
 				qrb.regionFreeWait(0, qrb.cPos-qrb.ePos, 0)
-				if qrb.errCondition != nil {
-					qrb.Unlock()
-					return
-				}
 
 				// If we do end up waiting above, we will unlock the mutex,
 				// which means emitter could advance, which in turn means
@@ -729,14 +707,6 @@ func (qrb *QuantizedRingBuffer) collector() {
 			select {
 			case <-qrb.condEmitterChange:
 				// just waiting, nothing to do
-			case <-qrb.semStopCollector:
-				qrb.Lock()
-				if qrb.opts.TrackTiming {
-					qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
-				}
-				qrb.errCondition = ErrCollectorStopped
-				qrb.Unlock()
-				return
 			}
 			qrb.Lock()
 			if qrb.opts.TrackTiming {
@@ -755,22 +725,8 @@ func (qrb *QuantizedRingBuffer) collector() {
 			}
 		}
 
-		// we may shrink the free range if it would save us from waiting
+		// we may shrink the free range if it would preempt us waiting
 		couldRead = qrb.regionFreeWait(qrb.cPos, mustRead, couldRead)
-		if qrb.errCondition != nil {
-			qrb.Unlock()
-			return
-		}
-
-		// one last stop-check before asking the reader for more
-		select {
-		case <-qrb.semStopCollector:
-			qrb.errCondition = ErrCollectorStopped
-			qrb.Unlock()
-			return
-		default:
-			// proceed
-		}
 
 		if debugReservationsEnabled {
 			debugReservations(" writing [%9d:%9d]", qrb.cPos, qrb.cPos+couldRead)
@@ -809,42 +765,15 @@ func (qrb *QuantizedRingBuffer) collector() {
 }
 
 /*
-StopFill is used to shutdown the collector goroutine without having reached
-an io error on the underlying io.Reader. Calling this function blocks until
-the collector goroutine exits. Note that if the goroutine is currently busy
-performing a syscall as part of a Read(…), it may take an arbitrarily long
-amount of time to return. In cases of a blocked system read you will need to
-arrange for a signal to be delivered to your process, interrupting all
-syscalls.
+IsCollectorRunning returns a boolean indicating whether a collector goroutine
+currently exists. Only useful for debugging purposes.
 */
-func (qrb *QuantizedRingBuffer) StopFill() (didResultInStop bool) {
+func (qrb *QuantizedRingBuffer) IsCollectorRunning() bool {
 	select {
-
 	case <-qrb.semCollectorDone:
-		// already stopped
-
-	case <-qrb.semStopCollector:
-		// wait for stop-in-progress
-		<-qrb.semCollectorDone
-
-	default:
-
-		// issue stop
-		// do so in a (possibly itself deadlock-prone) lock as the select is non-atomic
-		qrb.Lock()
-		select {
-		case <-qrb.semStopCollector:
-		default:
-			close(qrb.semStopCollector)
-			didResultInStop = true
-		}
-		qrb.Unlock()
-
-		// wait for stop
-		<-qrb.semCollectorDone
+		return false
 	}
-
-	return
+	return true
 }
 
 /*
@@ -887,7 +816,7 @@ func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 		qrb.Lock()
 	}
 
-	if qrb.errCondition != io.EOF && qrb.errCondition != ErrCollectorStopped {
+	if qrb.errCondition != io.EOF {
 		// not starting anything - we are already in hard error for the Reader
 		return qrb.errCondition
 	} else if readLimit < 0 {
@@ -910,7 +839,6 @@ func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 	qrb.cPos = 0
 	qrb.wrapPos = 0
 	qrb.errCondition = nil
-	qrb.semStopCollector = make(chan struct{})
 	qrb.semCollectorDone = make(chan struct{})
 	if readLimit > 0 {
 		qrb.streamRemaining = readLimit
@@ -919,11 +847,9 @@ func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
 	}
 
 	// Terminates on its own at stream end / error, sets qrb.errCondition
-	// also responds to qrb.Stop()
 	// Direct ctx-based cancellation not implemented deliberately, as it would
 	// be misleading: there is no cancellation support on most io.Reader's
-	// Instead use the blocking Stop() which will not return unless the goroutine
-	// is truly terminated
+	// short of closing - and we don't do that in the library itself
 	// Also https://dave.cheney.net/2017/08/20/context-isnt-for-cancellation
 	go qrb.collector()
 
@@ -981,7 +907,6 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 	}
 
 	var t0 time.Time
-	var stopReceived bool
 
 	// We do not refer to volatile parts of qrb.* in the loop
 	// Remain unlocked for the duration of waiting on releases
@@ -990,9 +915,6 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 		qrb.Lock()
 		if qrb.opts.TrackTiming {
 			qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
-		}
-		if stopReceived {
-			qrb.errCondition = ErrCollectorStopped
 		}
 	}()
 	if qrb.opts.TrackTiming {
@@ -1020,13 +942,9 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 			}
 
 			select {
-			// just block until release or stop
+			// just block until release
 			case <-qrb.condReservationRelease:
-			case <-qrb.semStopCollector:
-				stopReceived = true
-				return
 			}
-
 		}
 
 		// sector is free for our purposes \o/
