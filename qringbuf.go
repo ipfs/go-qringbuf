@@ -756,6 +756,10 @@ func (qrb *QuantizedRingBuffer) collector() {
 		// we may shrink the free range if it would preempt us waiting
 		couldRead = qrb.regionFreeWait(qrb.cPos, mustRead, couldRead)
 
+		qrb.Unlock()
+		if qrb.opts.TrackTiming {
+			t0 = time.Now()
+		}
 		if debugReservationsEnabled {
 			debugReservations(" writing [%9d:%9d]", qrb.cPos, qrb.cPos+couldRead)
 		}
@@ -765,7 +769,11 @@ func (qrb *QuantizedRingBuffer) collector() {
 		if debugReservationsEnabled {
 			debugReservations("   wrote [%9d:%9d]", qrb.cPos, qrb.cPos+didRead)
 		}
+		qrb.Lock()
 		if qrb.statsEnabled {
+			if qrb.opts.TrackTiming {
+				qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
+			}
 			qrb.opts.Stats.ReadCalls++
 		}
 
