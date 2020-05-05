@@ -2,47 +2,54 @@
 Package qringbuf provides a concurrency-friendly zero-copy abstraction of
 io.ReadAtLeast(…) over a pre-allocated ring-buffer, populated asynchronously
 by a standalone goroutine. It is primarily designed for processing a series
-of arbitrary streams each comprised of variable-length records. See the
-Examples section and the additional example at StartFill(…) further down.
+of arbitrary sub-streams form a single io.Reader, each sub-stream in turn
+comprised of variable-length records.
 
-Specifically an object of this package makes the following guarantees:
- • Memory is allocated only at construction time, never during streaming
- • StartFill(…) spawns off a single goroutine (collector) which terminates when:
-   ◦ It reaches readLimit, if one was supplied
-   ◦ It receives any error from the wrapped reader (including io.EOF)
- • Every call to NextRegion(…) blocks until it can return:
-   ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
-   ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
-   ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
- • *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
- • Data backing a *Region is guaranteed to remain available / not be overwritten provided:
-   ◦ NextRegion(…) has not been called again allowing further writes into the buffer
-   ◦ *Region.Reserve() was invoked, which blocks writes until a *Region.Release()
+The buffer object DOES NOT ASSUME exclusive ownership of the supplied io.Reader,
+never reads more than instructed by an argument to StartFill(…), and exposes
+a standard sync.Mutex interface allowing pausing all operations when exclusive
+access of the underlying Reader is desired.
 
 Examples
+
+In all cases below the background "collector" goroutine reading from the
+enclosed someIoReader into the ring buffer is guaranteed to:
+ - never overwrite the buffer portion backing the latest result of NextRegion(…)
+ - never overwrite any buffer portion backing a Reserve()d (Sub)Region
 
 In code the basic usage looks roughly like this:
 
 	qrb, initErr := qringbuf.NewFromReader(someIoReader, qringbuf.Config{…})
 	…
-	readLimit = int64(stopReadingAfterThatManyBytes)
-	startErr := qrb.StartFill(readLimit)
-	…
-	var available, processed int
+	var nextSubstreamSize int64
 	for {
-		// Reevaluate available and processed from the *previous* round,
-		// indicating how much has NOT been processed, and needs re-serving
-		reg, streamErr := qrb.NextRegion(available - processed)
+		sizeErr := binary.Read(
+			someIoReader,
+			binary.BigEndian,
+			&nextSubstreamSize,
+		)
+		…
+		startErr := qrb.StartFill(nextSubstreamSize)
+		…
+		var available, processed int
+		for {
+			// Reevaluate available and processed from the *previous* round,
+			// indicating how much has NOT been processed, and needs re-serving
+			// Note: one MUST advance the stream by at least a single byte
+			reg, streamErr := qrb.NextRegion(available - processed)
 
-		// io.EOF only means the collector stopped: there could be up to
-		// BufferSize() bytes remaining in the buffer. Loop until reg is nil
-		if (streamErr != nil && streamErr != io.EOF) || reg == nil {
-			return streamErr
+			// io.EOF only means the collector stopped: there could be up to
+			// BufferSize() bytes remaining in the buffer. Loop until reg is nil
+			if (streamErr != nil && streamErr != io.EOF) {
+				return streamErr
+			} else if reg == nil {
+				break
+			}
+
+			// Work with region, processing all or just a portion of the data
+			available = reg.Size()
+			processed = frobnicate(reg.Bytes(), …)
 		}
-
-		// Work with region, processing all or just a portion of the data
-		available = reg.Size()
-		processed = frobnicate(reg.Bytes(), …)
 	}
 
 In addition one can operate over individual (sub)regions with "fearless
@@ -53,12 +60,15 @@ concurrency":
 	for {
 		// Reevaluate available and processed from the *previous* round,
 		// indicating how much has NOT been processed, and needs re-serving
+		// Note: one MUST advance the stream by at least a single byte
 		reg, streamErr := qrb.NextRegion(available - processed)
 
 		// io.EOF only means the collector stopped: there could be up to
-		// BufferSize bytes remaining in the buffer. Loop until reg is nil
-		if (streamErr != nil && streamErr != io.EOF) || reg == nil {
+		// BufferSize() bytes remaining in the buffer. Loop until reg is nil
+		if (streamErr != nil && streamErr != io.EOF) {
 			return streamErr
+		} else if reg == nil {
+			break
 		}
 
 		available = reg.Size()
@@ -75,26 +85,37 @@ concurrency":
 		}()
 	}
 
-In all cases the background collector goroutine reading from *someReader
-into the ring buffer is guaranteed to:
- - never overwrite the buffer portion backing the latest result of NextRegion(…)
- - never overwrite any buffer portion backing a Reserve()d (Sub)Region
-
 Implementation notes
 
-Unlike io.ReadAtLeast, errors from the underlying reader are always made
-available on NextRegion(…). As with the standard io.* semantics an error can
-be returned together with a result. One should always check whether the
-*Region return value is nil first, before processing the error,
+The specific technical guarantees made by an object of this package are:
+ • Memory for incoming data is allocated only at construction time, never during streaming
+ • StartFill(…) spawns off one (and only one) goroutine (collector) which terminates when:
+   ◦ It reaches readLimit, if one was supplied to StartFill(…)
+   ◦ It receives any error from the wrapped reader (including io.EOF or os.ErrClosed)
+ • Every call to NextRegion(…) blocks until it can return:
+   ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
+   ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
+   ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
+ • *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
+ • Data backing a *Region is guaranteed to remain available / not be overwritten, provided:
+   ◦ NextRegion(…) has not been called again allowing further writes into the buffer
+   ◦ *Region.Reserve() was invoked, which blocks writes until a subsequent *Region.Release()
 
-Changes of the emitter and collector positions are protected by a mutex on
-the qringbuf object. Any call accessing the buffer state will block until
-this lock can be obtained. One can also lock the mutex if the collector
-goroutine needs to be paused for whatever reason.
+Unlike io.ReadAtLeast(…), errors from the underlying reader are always made
+available on NextRegion(…). As with the standard io.Read(…) semantics, an error
+can be returned together with a result. One should always check whether the
+*Region return value is nil first, before processing the error. See the
+documentation of io.Read() for an extended discussion.
 
-The region Reserve()/Release() functionality does not use the mutex, ensuring
-that an asynchronous Release() call can not be affected by the current state
-of the buffer. Reservation tracking is implemented as an atomically modified
+Changes of the NextRegion() "emitter" and collector positions are protected by
+a mutex on the qringbuf object. Calls modifying the buffer state will block
+until this lock can be obtained. The same mutex is exposed as part of the API,
+so one can pause the collector if a direct read and/or skip on the underlying
+io.Reader is needed.
+
+The *Region.{Reserve/Release}() functionality does not use the mutex, ensuring
+that an asynchronous Release() call can not be affected by the current state of
+the buffer. Reservation tracking is implemented as an atomically modified
 list of reservation counts, one int32 per SectorSize bytes of the buffer.
 
 The reservation system explicitly allows "recursive locking": you can hold
@@ -188,6 +209,7 @@ arbitrary stream of contiguous bytes.
 package qringbuf
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -494,10 +516,11 @@ informative error messages:
 			expectedStreamLengthPassedToStartFill,
 		)
 	}
+NOTE: if the collector is active as per IsCollectorRunning(), you *MUST* Lock()
+the qringbuf object before calling Buffered(). Otherwise you will race with the
+collector changing internal position indexes as it continues doing its job.
 */
 func (qrb *QuantizedRingBuffer) Buffered() int {
-	defer qrb.Unlock()
-	qrb.Lock()
 	return qrb.cPos - (qrb.ePos + qrb.curRegionSize)
 }
 
@@ -772,51 +795,50 @@ func (qrb *QuantizedRingBuffer) IsCollectorRunning() bool {
 	select {
 	case <-qrb.semCollectorDone:
 		return false
+	default:
+		return true
 	}
-	return true
 }
 
 /*
-StartFill is called at the start of every stream-cycle. If readLimit is 0
-collector will continue until the underlying io.Reader returns io.EOF.
-If readLimit is a positive value, the collector will read exactly that many
-bytes before shutting down. If the underlying reader returns io.EOF before
-readLimit is reached, NextRegion(…) will return io.ErrUnexpectedEOF.
+StartFill is the method kicking off the background "collector" goroutine, which
+then asynchronously writes bytes from the underlying io.Reader into the buffer.
+This method must be called at the start of every stream-cycle.
 
-Note that one can process the same io.Reader as multiple consecutive
-sub-streams, using the same qringbuf object and buffer allocation. All you
-need is the ability to determine the length of each sub-stream in advance.
-For instance, given a reader r into a stream of SInt64-length-prefixed
-sub-streams, one can do something like:
-	qrb, err := qringbuf.NewFromReader(r, qringbuf.Config{…})
-	for {
-		var nextSubstreamSize int64
-		err := binary.Read(
-			r,
-			binary.BigEndian,
-			&nextSubstreamSize,
-		)
-		qrb.StartFill(nextSubstreamSize)
-		for {
-			// process sub-stream until io.EOF as shown in Examples, then repeat
-		}
-	}
+Note that a typical use-case of this library is processing a single io.Reader
+as a series of multiple consecutive sub-streams, using the same qringbuf object
+and buffer allocation. All one needs is the ability to determine the length of
+each sub-stream in advance. See the Examples at the start of this document for
+a complete pseudo-program illustrating this workflow.
+
+No direct controls of the collector goroutine are exposed: the collector will
+keep trying to read into the buffer until reaching the given readLimit or until
+the underlying io.Reader returns an error. Closing the io.Reader will result in
+os.ErrClosed, and thus terminate the collector.
+
+It the supplied readLimit is 0 the collector will continue reading into the
+buffer until the underlying io.Reader returns io.EOF. If readLimit is a
+non-zero value, the collector will read exactly that many bytes before shutting
+down. If the underlying reader returns io.EOF before readLimit is reached,
+NextRegion(…) will return io.ErrUnexpectedEOF.
+
+If any error other than io.EOF has been encountered, you will not be able to
+restart a collector via StartFill(). The only way to recover is to allocate
+a new qringbuf object.
 */
 func (qrb *QuantizedRingBuffer) StartFill(readLimit int64) error {
-	// wait until shut down
-	<-qrb.semCollectorDone
-
 	qrb.Lock()
 	defer qrb.Unlock()
 
-	// wait until drained
-	for qrb.curRegionSize > 0 {
-		qrb.Unlock()
-		<-qrb.condEmitterChange
-		qrb.Lock()
-	}
-
-	if qrb.errCondition != io.EOF {
+	if qrb.IsCollectorRunning() {
+		return errors.New(
+			"start failed: collector still running from previous cycle",
+		)
+	} else if qrb.curRegionSize > 0 {
+		return errors.New(
+			"start failed: detected an active NextRegion() from previous cycle",
+		)
+	} else if qrb.errCondition != io.EOF {
 		// not starting anything - we are already in hard error for the Reader
 		return qrb.errCondition
 	} else if readLimit < 0 {
