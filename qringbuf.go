@@ -1,8 +1,8 @@
 /*
-Package qringbuf provides a concurrency-friendly zero-copy abstraction of
+Package qringbuf provides a concurrency-friendly, zero-copy abstraction of
 io.ReadAtLeast(…) over a pre-allocated ring-buffer, populated asynchronously
 by a standalone goroutine. It is primarily designed for processing a series
-of arbitrary sub-streams form a single io.Reader, each sub-stream in turn
+of consecutive sub-streams from a single io.Reader, each sub-stream in turn
 comprised of variable-length records.
 
 The buffer object DOES NOT ASSUME exclusive ownership of the supplied io.Reader,
@@ -17,7 +17,7 @@ enclosed someIoReader into the ring buffer is guaranteed to:
  - never overwrite the buffer portion backing the latest result of NextRegion(…)
  - never overwrite any buffer portion backing a Reserve()d (Sub)Region
 
-In code the basic usage looks roughly like this:
+In code the basic usage looks roughly like this (error/flow handling elided):
 
 	qrb, initErr := qringbuf.NewFromReader(someIoReader, qringbuf.Config{…})
 	…
@@ -105,9 +105,9 @@ Unlike io.ReadAtLeast(…), errors from the underlying reader are always made
 available on NextRegion(…). As with the standard io.Read(…) semantics, an error
 can be returned together with a result. One should always check whether the
 *Region return value is nil first, before processing the error. See the
-documentation of io.Read() for an extended discussion.
+documentation of io.Read(…) for an extended discussion.
 
-Changes of the NextRegion() "emitter" and collector positions are protected by
+Changes of the NextRegion(…) "emitter" and collector positions are protected by
 a mutex on the qringbuf object. Calls modifying the buffer state will block
 until this lock can be obtained. The same mutex is exposed as part of the API,
 so one can pause the collector if a direct read and/or skip on the underlying
@@ -198,7 +198,7 @@ arbitrary stream of contiguous bytes.
       |0        |10       |20       |30       |40       |50       |60
 
  ⑥ User recycles 4 bytes, NextRegion(4) serves available 27 bytes, and
-    the cycle repeats from the top until error or EOF
+    the cycle continues from the top until error or EOF
       ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
       ┋             wwwwccccccccccccccccccccccc|C=41                  ┃
       ┋             E=14======================<|                      ┃
@@ -485,11 +485,9 @@ func NewFromReader(
 		qrb.opts.TrackTiming = false
 	}
 
-	sectorCount := cfg.BufferSize / cfg.SectorSize
-	// silliness to avoid invoking math.Ceil
-	if cfg.BufferSize%cfg.SectorSize != 0 {
-		sectorCount++
-	}
+	// integer-based math.Ceil()
+	sectorCount := (cfg.BufferSize + cfg.SectorSize - 1) / cfg.SectorSize
+
 	qrb.reservationSectors = make([]sectorState, sectorCount)
 	for i := range qrb.reservationSectors {
 		qrb.reservationSectors[i].sectorOffset = cfg.SectorSize * i
