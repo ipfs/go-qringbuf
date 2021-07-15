@@ -731,10 +731,7 @@ func (qrb *QuantizedRingBuffer) collector() {
 				}
 			}
 			qrb.Unlock()
-			select {
-			case <-qrb.condEmitterChange:
-				// just waiting, nothing to do
-			}
+			<-qrb.condEmitterChange // just waiting, nothing to do
 			qrb.Lock()
 			if qrb.opts.TrackTiming {
 				qrb.opts.Stats.CollectorWaitNanoseconds += time.Since(t0).Nanoseconds()
@@ -985,10 +982,8 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 				return
 			}
 
-			select {
 			// just block until release
-			case <-qrb.condReservationRelease:
-			}
+			<-qrb.condReservationRelease
 		}
 
 		// we got that far - sector is free for our purposes \o/
