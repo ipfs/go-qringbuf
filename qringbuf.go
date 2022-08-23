@@ -10,12 +10,12 @@ never reads more than instructed by an argument to StartFill(…), and exposes
 a standard sync.Mutex interface allowing pausing all operations when exclusive
 access of the underlying Reader is desired.
 
-Examples
+# Examples
 
 In all cases below the background "collector" goroutine reading from the
 enclosed someIoReader into the ring buffer is guaranteed to:
- - never overwrite the buffer portion backing the latest result of NextRegion(…)
- - never overwrite any buffer portion backing a Reserve()d (Sub)Region
+  - never overwrite the buffer portion backing the latest result of NextRegion(…)
+  - never overwrite any buffer portion backing a Reserve()d (Sub)Region
 
 In code the basic usage looks roughly like this (error/flow handling elided):
 
@@ -85,21 +85,21 @@ concurrency":
 		}()
 	}
 
-Implementation notes
+# Implementation notes
 
 The specific technical guarantees made by an object of this package are:
- • Memory for incoming data is allocated only at construction time, never during streaming
- • StartFill(…) spawns off one (and only one) goroutine (collector) which terminates when:
-   ◦ It reaches readLimit, if one was supplied to StartFill(…)
-   ◦ It receives any error from the wrapped reader (including io.EOF or os.ErrClosed)
- • Every call to NextRegion(…) blocks until it can return:
-   ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
-   ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
-   ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
- • *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
- • Data backing a *Region is guaranteed to remain available / not be overwritten, provided:
-   ◦ NextRegion(…) has not been called again allowing further writes into the buffer
-   ◦ *Region.Reserve() was invoked, which blocks writes until a subsequent *Region.Release()
+  - Memory for incoming data is allocated only at construction time, never during streaming
+  - StartFill(…) spawns off one (and only one) goroutine (collector) which terminates when:
+    ◦ It reaches readLimit, if one was supplied to StartFill(…)
+    ◦ It receives any error from the wrapped reader (including io.EOF or os.ErrClosed)
+  - Every call to NextRegion(…) blocks until it can return:
+    ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
+    ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
+    ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
+  - *Region.Bytes() is always a slice of the underlying buffer, no data copying takes place
+  - Data backing a *Region is guaranteed to remain available / not be overwritten, provided:
+    ◦ NextRegion(…) has not been called again allowing further writes into the buffer
+    ◦ *Region.Reserve() was invoked, which blocks writes until a subsequent *Region.Release()
 
 Unlike io.ReadAtLeast(…), errors from the underlying reader are always made
 available on NextRegion(…). As with the standard io.Read(…) semantics, an error
@@ -125,6 +125,7 @@ obtained previously, otherwise the collector will remain blocked forever.
 
 Follows an illustration of a contrived lifecycle of a hypothetical qringbuf
 object initialized with:
+
 	qringbuf.Config{
 		BufferSize: 64,
 		MinRegion:  16,
@@ -142,69 +143,68 @@ below. Instead the diagrams merely demonstrate the choices this library
 makes dealing with the "tricky parts" of maintaining the illusion of an
 arbitrary stream of contiguous bytes.
 
- † C is the collector position: the *end* of the most recent read from the underlying io.Reader
-   E is the emitter position: the *start* of the most recently returned NextRegion(…)
-   W is the last value of "E" before a wrap took place, 0 otherwise
+	† C is the collector position: the *end* of the most recent read from the underlying io.Reader
+	  E is the emitter position: the *start* of the most recently returned NextRegion(…)
+	  W is the last value of "E" before a wrap took place, 0 otherwise
 
- ⓪ Buffer initialized, StartFill(…) is called.
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      C=0                                                             ┃
-      E=0                                                             ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
+	⓪ Buffer initialized, StartFill(…) is called.
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     C=0                                                             ┃
+	     E=0                                                             ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 
- ① NextRegion(0) is blocked until MinRegion of 16 is available,
-    fill in progress
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      cccccccccc|C=10                                                 ┃
-      E=0                                                             ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
+	① NextRegion(0) is blocked until MinRegion of 16 is available,
+	   fill in progress
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     cccccccccc|C=10                                                 ┃
+	     E=0                                                             ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 
- ② NextRegion(0) returned the first 30 bytes when it could,
-    collector keeps reading further
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      eeeeeeeeeeeeeeeeeeeeeeeeeeeeeecccccccccc|C=40                   ┃
-      E=0==========================<                                  ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
+	② NextRegion(0) returned the first 30 bytes when it could,
+	   collector keeps reading further
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     eeeeeeeeeeeeeeeeeeeeeeeeeeeeeecccccccccc|C=40                   ┃
+	     E=0==========================<                                  ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 
- ③ User reserves subRegion 18~21 for async workers, recycles last 6 of the
-    30 bytes, NextRegion(6) returns 17 bytes available at the time, 23 total.
-    Collector keeps reading, until it can no longer satisfy MinRead
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      ┋                 RRRR  eeeeeeeeeeeeeeeeeeeeeeecccccccccccc|C=59┃
-      ┋                 RRRR  E=24==================<                 ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
+	③ User reserves subRegion 18~21 for async workers, recycles last 6 of the
+	   30 bytes, NextRegion(6) returns 17 bytes available at the time, 23 total.
+	   Collector keeps reading, until it can no longer satisfy MinRead
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     ┋                 RRRR  eeeeeeeeeeeeeeeeeeeeeeecccccccccccc|C=59┃
+	     ┋                 RRRR  E=24==================<                 ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 
- ④ User recycles last 6 bytes, NextRegion(6) serves the remaining 18 bytes
-    Collector now can satisfy MaxCopy, and copies everything over,
-    repositioning the emitter index. It then blocks, as it can't write
-    past the not-yet released reservation.
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      W=41wwwwwwwwwwwwww|C=18                  eeeeeeeeeeeeeeeeee|    ┃
-      E=0               RRRR                   W=41=============<|    ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
+	④ User recycles last 6 bytes, NextRegion(6) serves the remaining 18 bytes
+	   Collector now can satisfy MaxCopy, and copies everything over,
+	   repositioning the emitter index. It then blocks, as it can't write
+	   past the not-yet released reservation.
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     W=41wwwwwwwwwwwwww|C=18                  eeeeeeeeeeeeeeeeee|    ┃
+	     E=0               RRRR                   W=41=============<|    ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 
- ⑤ The async job finishes, reservation is released, collector can now
-    advance further, and blocks again as NextRegion(…) has not been called
-    meaning the last 18 bytes are still being processed.
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      W=41wwwwwwwwwwwwwwccccccccccccccccccccccc|C=41|eeeeeeeeeeee|    ┃
-      E=0                                      W=41=============<|    ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
+	⑤ The async job finishes, reservation is released, collector can now
+	   advance further, and blocks again as NextRegion(…) has not been called
+	   meaning the last 18 bytes are still being processed.
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     W=41wwwwwwwwwwwwwwccccccccccccccccccccccc|C=41|eeeeeeeeeeee|    ┃
+	     E=0                                      W=41=============<|    ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 
- ⑥ User recycles 4 bytes, NextRegion(4) serves available 27 bytes, and
-    the cycle continues from the top until error or EOF
-      ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
-      ┋             wwwwccccccccccccccccccccccc|C=41                  ┃
-      ┋             E=14======================<|                      ┃
-      ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
-      |0        |10       |20       |30       |40       |50       |60
-
+	⑥ User recycles 4 bytes, NextRegion(4) serves available 27 bytes, and
+	   the cycle continues from the top until error or EOF
+	     ╆━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╅
+	     ┋             wwwwccccccccccccccccccccccc|C=41                  ┃
+	     ┋             E=14======================<|                      ┃
+	     ╄━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╃
+	     |0        |10       |20       |30       |40       |50       |60
 */
 package qringbuf
 
@@ -239,6 +239,7 @@ type Region struct {
 /*
 Size returns the size of the region in bytes. It is equivalent to (but
 cheaper than):
+
 	len(r.Bytes)
 */
 func (r *Region) Size() int { return r.size }
@@ -255,6 +256,7 @@ func (r *Region) Bytes() []byte { return r.qrb.buf[r.offset : r.offset+r.size] }
 SubRegion is analogous to re-slicing. Supplying offset/length values causing
 an out of bounds re-slice results in log.Panic(). As a special case one can
 "clone" a *Region object via:
+
 	clone := region.SubRegion(0, region.Size())
 */
 func (r *Region) SubRegion(offset, length int) *Region {
@@ -509,6 +511,7 @@ func (qrb *QuantizedRingBuffer) signalCond(c chan<- struct{}) {
 Buffered returns the current amount of data already read from the underlying
 reader, but not yet served via NextRegion(…). It is primarily useful for
 informative error messages:
+
 	if err == io.ErrUnexpectedEOF {
 		return fmt.Errorf(
 			"unexpected end of stream after %d bytes (stream expected to be %d bytes long)",
@@ -516,6 +519,7 @@ informative error messages:
 			expectedStreamLengthPassedToStartFill,
 		)
 	}
+
 NOTE: if the collector is active as per IsCollectorRunning(), you *MUST* Lock()
 the qringbuf object before calling Buffered(). Otherwise you will race with the
 collector changing internal position indexes as it continues doing its job.
@@ -534,9 +538,10 @@ initializing your qringbuf with MinRegion equal to this maximum value, you
 guarantee never experiencing a "short-read".
 
 Every call to NextRegion(…) blocks until it can return:
- ◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
- ◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
- ◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
+
+	◦ ( *Region object representing a contiguous slice of at least MinRegion bytes, nil )
+	◦ ( *Region object representing all remaining data, any underlying error including io.EOF )
+	◦ ( nil when there is no data remaining in buffer, any underlying error including io.EOF )
 
 Any error encountered on the underlying io.Reader, including io.EOF, is
 returned on every subsequent NextRegion(…) call, often combined with a
@@ -1001,7 +1006,6 @@ func (qrb *QuantizedRingBuffer) regionFreeWait(offset, min, max int) (available 
 }
 
 /*
-
 while true; do tmp/maintbin/dezstd $( ls maint/testdata/*repeat* | sort -R ) $( ls maint/testdata/*repeat* | sort -R ) \
 | go run ./cmd/stream-dagger/ --multipart --process-nul-inputs --ipfs-add-compatible-command="--upgrade-cidv0-in-output --raw-leaves=true --chunker=rabin" \
 | tee /dev/stderr | grep -oE 'cid.*' |sort | md5sum | tee /dev/stderr | grep -q 7471fa247efa2ae39d30df92562993d6 || break
@@ -1024,7 +1028,6 @@ while true; do zstd -qdck maint/testdata/repeat_0.04GiB_174.zst \
 --emit-stdout=none --emit-stderr=roots-jsonl,chunks-jsonl 2>e3 >s3
 grep 'event.*root.*bafybeid5puqcsobeg226l6dfvcwznyi4tq4ezjmphikdi2pszffw3stuym' e3 || break
 done
-
 */
 const debugReservationsEnabled bool = false
 
